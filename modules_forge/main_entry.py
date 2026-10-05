@@ -27,8 +27,8 @@ ui_forge_preset: gr.Radio
 ui_checkpoint: gr.Dropdown
 ui_vae: gr.Dropdown
 ui_forge_unet_dtype: gr.Radio
-ui_h3_references: gr.File
 ui_img2img_tab: gr.TabItem = None
+ui_img2img_modes: tuple = None  # (gr.Tabs, [gr.TabItem], img2img_selected_tab)
 
 forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
     "Automatic": (None, False),
@@ -44,7 +44,7 @@ module_list: dict[str, os.PathLike] = {}
 
 
 def make_checkpoint_manager_ui():
-    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_h3_references
+    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype
 
     if shared.opts.sd_model_checkpoint in [None, "None", "none", ""]:
         if len(sd_models.checkpoints_list) == 0:
@@ -71,20 +71,6 @@ def make_checkpoint_manager_ui():
     ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
     ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
     ui_forge_unet_dtype.input(dtype_change, inputs=[ui_forge_unet_dtype, ui_forge_preset], queue=False, show_progress=False)
-
-    from modules_forge import minimax_h3
-
-    ui_h3_references = gr.File(
-        label="Reference Images",
-        file_count="multiple",
-        file_types=["image"],
-        type="filepath",
-        height=96,
-        min_width=200,
-        visible=shared.opts.forge_preset == PresetArch.h3.name,
-        elem_id="forge_h3_references",
-    )
-    ui_h3_references.change(minimax_h3.set_reference_images, inputs=[ui_h3_references], queue=False, show_progress=False)
 
 
 def find_files_with_extensions(base_path: os.PathLike, extensions: list[str]) -> dict[str, os.PathLike]:
@@ -262,9 +248,8 @@ def forge_main_entry():
         ui_img2img_distilled_cfg,
         ui_txt2img_batch_size,
         ui_img2img_batch_size,
-        ui_h3_references,
         ui_img2img_tab or gr.State(None),
-        *minimax_h3.ui_panels,
+        *minimax_h3.preset_targets(),
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False).success(
@@ -298,13 +283,16 @@ def on_preset_change(preset: str):
     else:
         d_args = {"visible": False}
 
-    if is_video(preset) > 1:
-        batch_args_t2i = {**frame_slider(preset), "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
+    if preset == PresetArch.h3.name:
+        # length comes from "Video Duration"
+        batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": 1, "visible": False}
+    elif is_video(preset) > 1:
+        batch_args_t2i = {**frame_slider(preset), "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1), "visible": True}
     else:
-        batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
+        batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1), "visible": True}
 
     batch_args_i2i = batch_args_t2i.copy()
-    batch_args_i2i["value"] = getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
+    batch_args_i2i["value"] = 1 if preset == PresetArch.h3.name else getattr(shared.opts, f"{preset}_i2i_batch_size", 1)
 
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype
@@ -336,9 +324,8 @@ def on_preset_change(preset: str):
         # ui_txt2img_batch_size, ui_img2img_batch_size
         gr.update(**batch_args_t2i),
         gr.update(**batch_args_i2i),
-        # ui_h3_references, ui_img2img_tab
-        gr.update(visible=preset == PresetArch.h3.name),
+        # ui_img2img_tab
         gr.update(label="img2video" if preset == PresetArch.h3.name else "img2img") if ui_img2img_tab is not None else gr.skip(),
-        # MiniMax-H3 Video panels
-        *[gr.update(visible=preset == PresetArch.h3.name) for _ in minimax_h3.ui_panels],
+        # MiniMax-H3: Reference tabs, Segments / Duration, panels, img2img modes
+        *minimax_h3.preset_updates(preset),
     ]

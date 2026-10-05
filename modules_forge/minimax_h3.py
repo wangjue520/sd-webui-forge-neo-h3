@@ -12,16 +12,61 @@ import numpy as np
 import torch
 from PIL import Image
 
-reference_images: list[str] = []
-"""file paths from the "Reference Images" picker next to the Checkpoint selection"""
+reference_images: dict[str, list[str]] = {"txt2img": [], "img2img": []}
+"""file paths from the "参考图 / Reference" tab (next to Generation / Lora), per WebUI tab"""
 
 ui_panels: list = []
-"""the "MiniMax-H3 Video" accordions (txt2img / img2img); only visible for the h3 UI Preset"""
+"""components only visible for the h3 UI Preset (Reference tabs, Segments / Duration, MiniMax-H3 Video panels)"""
 
 
-def set_reference_images(files: list[str] | None):
-    global reference_images
-    reference_images = [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in (files or [])]
+def set_reference_images(tabname: str, files: list | None):
+    reference_images[tabname] = [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in (files or [])]
+
+
+def create_reference_tab(tabname: str):
+    """a tab in the Generation / Textual Inversion / Checkpoints / Lora row"""
+    import gradio as gr
+
+    from modules import shared
+
+    with gr.Tab("参考图 / Reference", id=f"{tabname}_h3_references", elem_id=f"{tabname}_h3_references_tab", visible=shared.opts.forge_preset == "h3") as tab:
+        gr.Markdown("参考图生视频（Reference-to-Video）：上传 1~9 张参考图，在提示词中可用 Picture 1、Picture 2… 指代。需使用 Ref2VA 模型；留空则为普通文生 / 图生视频。")
+        files = gr.File(label="Reference Images", file_count="multiple", file_types=["image"], type="filepath", elem_id=f"{tabname}_h3_references")
+        gallery = gr.Gallery(label="Preview", columns=6, height=240, interactive=False, elem_id=f"{tabname}_h3_references_preview")
+
+        def on_change(f):
+            set_reference_images(tabname, f)
+            return reference_images[tabname]
+
+        files.change(on_change, inputs=[files], outputs=[gallery], queue=False, show_progress=False)
+    ui_panels.append(tab)
+
+
+def preset_targets() -> list:
+    """components updated on UI Preset change (see main_entry.on_preset_change)"""
+    from modules_forge import main_entry
+
+    targets = list(ui_panels)
+    if (modes := getattr(main_entry, "ui_img2img_modes", None)) is not None:
+        tabs, items, selected = modes
+        targets += [tabs, *items, selected]
+    return targets
+
+
+def preset_updates(preset: str) -> list:
+    import gradio as gr
+
+    from modules_forge import main_entry
+
+    h3 = preset == "h3"
+    updates = [gr.update(visible=h3) for _ in ui_panels]
+    if (modes := getattr(main_entry, "ui_img2img_modes", None)) is not None:
+        _, items, _ = modes
+        updates.append(gr.update(selected="h3_i2v" if h3 else "img2img"))
+        updates += [gr.update(visible=not h3) for _ in items[:-2]]
+        updates += [gr.update(visible=h3) for _ in items[-2:]]
+        updates.append(gr.update(value=6 if h3 else 0))
+    return updates
 
 
 def _to_tensor(image: Image.Image) -> torch.Tensor:
@@ -106,8 +151,8 @@ def process_images(p) -> "Processed":
     model = shared.sd_model
     options: dict = getattr(p, "h3_options", None) or {}
 
-    # the "Frames" slider is the batch size for video presets
-    length = int(p.batch_size)
+    # length from "Video Duration" (seconds @ 24 fps); the Batch Size slider is hidden for h3
+    length = round(float(options["duration"]) * FPS) if options.get("duration") else int(p.batch_size)
     p.batch_size = 1
     p.do_not_save_grid = True
 
@@ -146,13 +191,16 @@ def process_images(p) -> "Processed":
     p.steps = steps
     p.extra_generation_params["Shift"] = shift
     p.extra_generation_params["Frames"] = length
+    if options.get("duration"):
+        p.extra_generation_params["Duration"] = options["duration"]
 
     # region Conditioning images
 
     first_frame = None
     if isinstance(p, StableDiffusionProcessingImg2Img) and getattr(p, "init_images", None):
         first_frame = _to_tensor(p.init_images[0])
-    last_frame = _to_tensor(options["last_frame"]) if options.get("last_frame") is not None else None
+    # "首尾帧图生视频" tab
+    last_frame = _to_tensor(p.h3_last_frame) if getattr(p, "h3_last_frame", None) is not None else None
 
     keyframes = []
     for path in options.get("keyframes", []):
@@ -162,7 +210,7 @@ def process_images(p) -> "Processed":
             print(f"[MiniMax-H3] failed to read keyframe {path}: {e}")
 
     references = []
-    for path in reference_images:
+    for path in reference_images["img2img" if isinstance(p, StableDiffusionProcessingImg2Img) else "txt2img"]:
         try:
             references.append(_to_tensor(Image.open(path)))
         except Exception as e:

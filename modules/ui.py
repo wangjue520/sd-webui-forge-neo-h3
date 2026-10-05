@@ -474,6 +474,10 @@ def create_ui():
         extra_networks_ui = ui_extra_networks.create_ui(txt2img_interface, [txt2img_generation_tab], "txt2img")
         ui_extra_networks.setup_ui(extra_networks_ui, output_panel.gallery)
 
+        from modules_forge import minimax_h3
+
+        minimax_h3.create_reference_tab("txt2img")
+
         extra_tabs.__exit__()
 
         if shared.opts.paste_safe_guard:
@@ -515,30 +519,31 @@ def create_ui():
                         toprow.create_inline_toprow_prompts()
 
                     if category == "image":
-                        with gr.Tabs(elem_id="mode_img2img"):
-                            img2img_selected_tab = gr.Number(value=0, visible=False)
+                        _is_h3 = shared.opts.forge_preset == "h3"
+                        with gr.Tabs(elem_id="mode_img2img", selected="h3_i2v" if _is_h3 else None) as img2img_mode_tabs:
+                            img2img_selected_tab = gr.Number(value=6 if _is_h3 else 0, visible=False)
 
-                            with gr.TabItem("img2img", id="img2img", elem_id="img2img_img2img_tab") as tab_img2img:
+                            with gr.TabItem("img2img", id="img2img", elem_id="img2img_img2img_tab", visible=not _is_h3) as tab_img2img:
                                 init_img = ForgeCanvas(elem_id="img2img_image", no_scribbles=True)
                                 add_copy_image_controls("img2img", init_img)
 
-                            with gr.TabItem("Sketch", id="img2img_sketch", elem_id="img2img_img2img_sketch_tab") as tab_sketch:
+                            with gr.TabItem("Sketch", id="img2img_sketch", elem_id="img2img_img2img_sketch_tab", visible=not _is_h3) as tab_sketch:
                                 sketch = ForgeCanvas(elem_id="img2img_sketch", scribble_color=opts.img2img_sketch_default_brush_color)
                                 add_copy_image_controls("sketch", sketch)
 
-                            with gr.TabItem("Inpaint", id="inpaint", elem_id="img2img_inpaint_tab") as tab_inpaint:
+                            with gr.TabItem("Inpaint", id="inpaint", elem_id="img2img_inpaint_tab", visible=not _is_h3) as tab_inpaint:
                                 init_img_with_mask = ForgeCanvas(elem_id="img2maskimg", contrast_scribbles=opts.img2img_inpaint_mask_high_contrast, scribble_color=opts.img2img_inpaint_mask_brush_color, scribble_color_fixed=True, scribble_alpha=opts.img2img_inpaint_mask_scribble_alpha, scribble_alpha_fixed=True, scribble_softness_fixed=True)
                                 add_copy_image_controls("inpaint", init_img_with_mask)
 
-                            with gr.TabItem("Inpaint sketch", id="inpaint_sketch", elem_id="img2img_inpaint_sketch_tab") as tab_inpaint_color:
+                            with gr.TabItem("Inpaint sketch", id="inpaint_sketch", elem_id="img2img_inpaint_sketch_tab", visible=not _is_h3) as tab_inpaint_color:
                                 inpaint_color_sketch = ForgeCanvas(elem_id="inpaint_sketch", scribble_color=opts.img2img_inpaint_sketch_default_brush_color)
                                 add_copy_image_controls("inpaint_sketch", inpaint_color_sketch)
 
-                            with gr.TabItem("Inpaint upload", id="inpaint_upload", elem_id="img2img_inpaint_upload_tab") as tab_inpaint_upload:
+                            with gr.TabItem("Inpaint upload", id="inpaint_upload", elem_id="img2img_inpaint_upload_tab", visible=not _is_h3) as tab_inpaint_upload:
                                 init_img_inpaint = gr.Image(label="Image for img2img", show_label=False, source="upload", interactive=True, type="pil", elem_id="img_inpaint_base")
                                 init_mask_inpaint = gr.Image(label="Mask", source="upload", interactive=True, type="pil", image_mode="RGBA", elem_id="img_inpaint_mask")
 
-                            with gr.TabItem("Batch", id="batch", elem_id="img2img_batch_tab") as tab_batch:
+                            with gr.TabItem("Batch", id="batch", elem_id="img2img_batch_tab", visible=not _is_h3) as tab_batch:
                                 with gr.Tabs(elem_id="img2img_batch_source"):
                                     img2img_batch_source_type = gr.Textbox(visible=False, value="upload")
                                     with gr.TabItem("Upload", id="batch_upload", elem_id="img2img_batch_upload_tab") as tab_batch_upload:
@@ -555,7 +560,17 @@ def create_ui():
                                     img2img_batch_png_info_dir = gr.Textbox(label="PNG info directory", **shared.hide_dirs, placeholder="Leave empty to use input directory", elem_id="img2img_batch_png_info_dir")
                                     img2img_batch_png_info_props = gr.CheckboxGroup(["Prompt", "Negative prompt", "Seed", "CFG scale", "Sampler", "Steps", "Model hash", "Filename"], label="Parameters to take from png info", info="Prompts from png info will be appended to prompts set in ui.")
 
-                            img2img_tabs = [tab_img2img, tab_sketch, tab_inpaint, tab_inpaint_color, tab_inpaint_upload, tab_batch]
+                            # MiniMax-H3 (UI Preset: h3) replaces the modes above
+                            with gr.TabItem("图生视频", id="h3_i2v", elem_id="img2img_h3_i2v_tab", visible=_is_h3) as tab_h3_i2v:
+                                h3_i2v_image = gr.Image(label="首帧 / First Frame", type="pil", sources=["upload", "clipboard"], height=480, elem_id="img2img_h3_i2v_image")
+
+                            with gr.TabItem("首尾帧图生视频", id="h3_flf2v", elem_id="img2img_h3_flf2v_tab", visible=_is_h3) as tab_h3_flf2v:
+                                with gr.Row():
+                                    h3_first_image = gr.Image(label="首帧 / First Frame", type="pil", sources=["upload", "clipboard"], height=400, elem_id="img2img_h3_first_image")
+                                    h3_last_image = gr.Image(label="尾帧 / Last Frame", type="pil", sources=["upload", "clipboard"], height=400, elem_id="img2img_h3_last_image")
+
+                            img2img_tabs = [tab_img2img, tab_sketch, tab_inpaint, tab_inpaint_color, tab_inpaint_upload, tab_batch, tab_h3_i2v, tab_h3_flf2v]
+                            main_entry.ui_img2img_modes = (img2img_mode_tabs, img2img_tabs, img2img_selected_tab)
 
                             for i, tab in enumerate(img2img_tabs):
                                 tab.select(fn=lambda tabnum=i: tabnum, outputs=[img2img_selected_tab])
@@ -740,6 +755,9 @@ def create_ui():
                 img2img_batch_png_info_dir,
                 img2img_batch_source_type,
                 img2img_batch_upload,
+                h3_i2v_image,
+                h3_first_image,
+                h3_last_image,
             ] + custom_inputs
 
             img2img_args = dict(
@@ -822,6 +840,8 @@ def create_ui():
 
         extra_networks_ui_img2img = ui_extra_networks.create_ui(img2img_interface, [img2img_generation_tab], "img2img")
         ui_extra_networks.setup_ui(extra_networks_ui_img2img, output_panel.gallery)
+
+        minimax_h3.create_reference_tab("img2img")
 
         extra_tabs.__exit__()
 
