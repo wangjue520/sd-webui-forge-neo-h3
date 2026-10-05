@@ -156,8 +156,23 @@ def _build(model_fn: Callable, sd: dict, storage_dtype, quant_config, compute_dt
             # always cast to the input dtype: the H3 modules mix fp32 islands with the compute dtype
             with using_forge_operations(device=device, dtype=dtype, manual_cast_enabled=True, sd_dtype=sd_dtype, extra_dtype=quant_config):
                 model = model_fn()
+    _fix_shapes(model, sd)
     load_state_dict(model, sd, log_name=name)
     return model
+
+
+def _fix_shapes(model: torch.nn.Module, sd: dict):
+    """GGUF stores at most 4 dims (e.g. the Qwen3-VL Conv3d patch embedding [1152, 3, 2, 16, 16] -> [3456, 2, 16, 16])"""
+    from backend.loader_gguf import dequantize
+
+    expected = {k: v.shape for k, v in model.state_dict().items()}
+    for k, v in list(sd.items()):
+        shape = expected.get(k, None)
+        if shape is None or tuple(v.shape) == tuple(shape) or math.prod(v.shape) != math.prod(shape):
+            continue
+        t = dequantize(v, torch.bfloat16) if getattr(v, "gguf_cls", None) is not None else v.detach().as_subclass(torch.Tensor)
+        sd[k] = t.to(torch.bfloat16).reshape(shape).clone()
+        logger.info(f"reshaped {k}: {tuple(v.shape)} -> {tuple(shape)}")
 
 
 # region Loading
