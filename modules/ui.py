@@ -898,8 +898,11 @@ def create_ui():
             for interface, label, ifid in sorted_interfaces:
                 if label in shared.opts.hidden_tabs:
                     continue
-                with gr.TabItem(label, id=ifid, elem_id=f"tab_{ifid}"):
+                with gr.TabItem(label, id=ifid, elem_id=f"tab_{ifid}") as _tab_item:
                     interface.render()
+
+                if ifid == "img2img":
+                    main_entry.ui_img2img_tab = _tab_item
 
                 if ifid not in ["extensions", "settings"]:
                     loadsave.add_block(interface, ifid)

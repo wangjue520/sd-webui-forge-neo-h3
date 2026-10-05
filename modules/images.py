@@ -989,7 +989,7 @@ def save_video(p, frames: list[np.ndarray], fps: int = 16, *, basename: str = ""
             "-map",
             "1:a?",
             "-acodec",
-            "copy",
+            "aac" if str(audio_copy).lower().endswith(".wav") else "copy",
         ]
 
     cmd += [

@@ -123,6 +123,18 @@ class Qwen25_7BVLI_Config:
 
 
 @dataclass
+class Qwen3VL_32BConfig(Qwen3VL_4BConfig):
+    # MiniMax-H3 conditioning checkpoint: truncated to the first 50 of 64 layers,
+    # consumed as the unnormalized hidden state after layer 50 (no final norm, no lm_head)
+    hidden_size: int = 5120
+    intermediate_size: int = 25600
+    num_hidden_layers: int = 50
+    num_attention_heads: int = 64
+    lm_head: bool = False
+    final_norm: bool = False
+
+
+@dataclass
 class Gemma2_2B_Config:
     vocab_size: int = 256000
     hidden_size: int = 2304
@@ -171,7 +183,7 @@ class Ministral3_3BConfig:
     stop_tokens = [2]
 
 
-def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None):
+def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None, interleaved_mrope=False):
     if not isinstance(theta, list):
         theta = [theta]
 
@@ -189,16 +201,28 @@ def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_di
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
-        if rope_dims is not None and position_ids.shape[0] > 1:
-            mrope_section = rope_dims * 2
-            cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
-            sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+        if rope_dims is not None and position_ids.shape[0] > 1 and interleaved_mrope:
+            # https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/text_encoders/llama.py
+            # Qwen3-VL interleaved MRoPE: T-freqs by default, H/W replace every 3rd dim
+            freqs_inter = freqs[0].clone()
+            for axis_idx, offset in ((1, 1), (2, 2)):
+                length = rope_dims[axis_idx] * 3
+                idx = slice(offset, length, 3)
+                freqs_inter[..., idx] = freqs[axis_idx, ..., idx]
+            emb = torch.cat((freqs_inter, freqs_inter), dim=-1)
+            cos = emb.cos().unsqueeze(0)
+            sin = emb.sin().unsqueeze(0)
         else:
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+            if rope_dims is not None and position_ids.shape[0] > 1:
+                mrope_section = rope_dims * 2
+                cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+                sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+            else:
+                cos = cos.unsqueeze(1)
+                sin = sin.unsqueeze(1)
 
         sin_split = sin.shape[-1] // 2
         out.append((cos, sin[..., :sin_split], -sin[..., sin_split:]))
@@ -447,7 +471,7 @@ class Llama2_(nn.Module):
         else:
             self.norm = None
 
-    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None):
+    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None, deepstack_embeds=None, visual_pos_masks=None):
         if embeds is not None:
             x = embeds
         else:
@@ -464,7 +488,7 @@ class Llama2_(nn.Module):
         if position_ids is None:
             position_ids = torch.arange(past_len, past_len + seq_len, device=x.device).unsqueeze(0)
 
-        freqs_cis = precompute_freqs_cis(self.config.head_dim, position_ids, self.config.rope_theta, self.config.rope_scale, self.config.rope_dims, device=x.device)
+        freqs_cis = precompute_freqs_cis(self.config.head_dim, position_ids, self.config.rope_theta, self.config.rope_scale, self.config.rope_dims, device=x.device, interleaved_mrope=getattr(self.config, "interleaved_mrope", False))
 
         mask = None
         if attention_mask is not None:
@@ -511,6 +535,10 @@ class Llama2_(nn.Module):
 
             if current_kv is not None:
                 next_key_values.append(current_kv)
+
+            # DeepStack: add per-layer visual features into the first len() decoder layers at image positions (Qwen3-VL)
+            if deepstack_embeds is not None and i < len(deepstack_embeds):
+                x[visual_pos_masks] = x[visual_pos_masks] + deepstack_embeds[i].to(x)
 
             if i == intermediate_output:
                 intermediate = x.clone()

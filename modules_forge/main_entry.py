@@ -18,7 +18,7 @@ from modules import (
     shared_items,
     ui_common,
 )
-from modules_forge.presets import PresetArch, is_video, use_distill, use_shift
+from modules_forge.presets import PresetArch, frame_slider, is_video, use_distill, use_shift
 
 logger = logging.getLogger("ui_models")
 setup_logger(logger)
@@ -27,6 +27,8 @@ ui_forge_preset: gr.Radio
 ui_checkpoint: gr.Dropdown
 ui_vae: gr.Dropdown
 ui_forge_unet_dtype: gr.Radio
+ui_h3_references: gr.File
+ui_img2img_tab: gr.TabItem = None
 
 forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
     "Automatic": (None, False),
@@ -42,7 +44,7 @@ module_list: dict[str, os.PathLike] = {}
 
 
 def make_checkpoint_manager_ui():
-    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype
+    global ui_forge_preset, ui_checkpoint, ui_vae, ui_forge_unet_dtype, ui_h3_references
 
     if shared.opts.sd_model_checkpoint in [None, "None", "none", ""]:
         if len(sd_models.checkpoints_list) == 0:
@@ -69,6 +71,20 @@ def make_checkpoint_manager_ui():
     ui_checkpoint.input(checkpoint_change, inputs=[ui_checkpoint, ui_forge_preset], queue=False, show_progress=False)
     ui_vae.input(modules_change, inputs=[ui_vae, ui_forge_preset], queue=False, show_progress=False)
     ui_forge_unet_dtype.input(dtype_change, inputs=[ui_forge_unet_dtype, ui_forge_preset], queue=False, show_progress=False)
+
+    from modules_forge import minimax_h3
+
+    ui_h3_references = gr.File(
+        label="Reference Images",
+        file_count="multiple",
+        file_types=["image"],
+        type="filepath",
+        height=96,
+        min_width=200,
+        visible=shared.opts.forge_preset == PresetArch.h3.name,
+        elem_id="forge_h3_references",
+    )
+    ui_h3_references.change(minimax_h3.set_reference_images, inputs=[ui_h3_references], queue=False, show_progress=False)
 
 
 def find_files_with_extensions(base_path: os.PathLike, extensions: list[str]) -> dict[str, os.PathLike]:
@@ -244,6 +260,8 @@ def forge_main_entry():
         ui_img2img_distilled_cfg,
         ui_txt2img_batch_size,
         ui_img2img_batch_size,
+        ui_h3_references,
+        ui_img2img_tab or gr.State(None),
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False).success(
@@ -275,8 +293,8 @@ def on_preset_change(preset: str):
     else:
         d_args = {"visible": False}
 
-    if (fps := is_video(preset)) > 1:
-        batch_args_t2i = {"minimum": 1, "maximum": fps * 15 + 1, "step": fps, "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
+    if is_video(preset) > 1:
+        batch_args_t2i = {**frame_slider(preset), "label": "Frames", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
     else:
         batch_args_t2i = {"minimum": 1, "maximum": 8, "step": 1, "label": "Batch Size", "value": getattr(shared.opts, f"{preset}_t2i_batch_size", 1)}
 
@@ -313,4 +331,7 @@ def on_preset_change(preset: str):
         # ui_txt2img_batch_size, ui_img2img_batch_size
         gr.update(**batch_args_t2i),
         gr.update(**batch_args_i2i),
+        # ui_h3_references, ui_img2img_tab
+        gr.update(visible=preset == PresetArch.h3.name),
+        gr.update(label="img2video" if preset == PresetArch.h3.name else "img2img") if ui_img2img_tab is not None else gr.skip(),
     ]

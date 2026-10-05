@@ -14,6 +14,7 @@ class PresetArch(Enum):
     ernie = 10  # Ernie-Image
     pid = 11  # PiD
     krea = 12  # Krea2
+    h3 = 13  # MiniMax-H3
 
     @staticmethod
     def choices() -> list[str]:
@@ -33,6 +34,7 @@ SAMPLERS = {
     PresetArch.ernie: "Euler",
     PresetArch.pid: "LCM",
     PresetArch.krea: "Euler",
+    PresetArch.h3: "Euler",
 }
 
 SCHEDULERS = {
@@ -48,6 +50,7 @@ SCHEDULERS = {
     PresetArch.ernie: "Simple",
     PresetArch.pid: "Simple",
     PresetArch.krea: "Simple",
+    PresetArch.h3: "Simple",
 }
 
 STEPS = {
@@ -63,6 +66,7 @@ STEPS = {
     PresetArch.ernie: 8,
     PresetArch.pid: 4,
     PresetArch.krea: 8,
+    PresetArch.h3: 30,
 }
 
 CFG = {
@@ -78,6 +82,7 @@ CFG = {
     PresetArch.ernie: 1.0,
     PresetArch.pid: 1.0,
     PresetArch.krea: 1.0,
+    PresetArch.h3: 1.0,
 }
 
 DISTILL = {
@@ -93,11 +98,29 @@ SHIFT = {
     PresetArch.ernie: 3.0,
     PresetArch.pid: -1.5,
     PresetArch.krea: -1.15,
+    PresetArch.h3: 12.0,
 }
 
 FRAMES = {
     PresetArch.wan.name: 16,
+    PresetArch.h3.name: 24,
 }
+
+FRAME_SLIDERS = {
+    # MiniMax-H3 snaps the length to 17k + 5 frames @ 24 fps (5 ~ 15 seconds)
+    PresetArch.h3.name: {"minimum": 5, "maximum": 362, "step": 17},
+}
+
+DEFAULT_FRAMES = {
+    PresetArch.h3.name: 124,  # ~5 seconds
+}
+
+
+def frame_slider(arch: str) -> dict:
+    if (slider := FRAME_SLIDERS.get(arch, None)) is not None:
+        return slider.copy()
+    fps = FRAMES.get(arch, 1)
+    return {"minimum": 1, "maximum": fps * 15 + 1, "step": fps}
 
 
 def use_distill(arch: str) -> bool:
@@ -215,8 +238,8 @@ def register(options_templates: dict):
                     (f"ui_{name}", name.upper(), "presets"),
                     {
                         f"{name}_batch1": OptionRow(),
-                        f"{name}_t2i_batch_size": OptionInfo(1, "txt2img Frames", Slider, {"minimum": 1, "maximum": fps * 15 + 1, "step": fps}),
-                        f"{name}_i2i_batch_size": OptionInfo(1, "img2img Frames", Slider, {"minimum": 1, "maximum": fps * 15 + 1, "step": fps}),
+                        f"{name}_t2i_batch_size": OptionInfo(DEFAULT_FRAMES.get(name, 1), "txt2img Frames", Slider, frame_slider(name)),
+                        f"{name}_i2i_batch_size": OptionInfo(DEFAULT_FRAMES.get(name, 1), "img2img Frames", Slider, frame_slider(name)),
                         f"{name}_batch0": OptionRow(),
                     },
                 )

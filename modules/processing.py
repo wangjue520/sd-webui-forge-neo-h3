@@ -854,6 +854,11 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 def process_images_inner(p: StableDiffusionProcessing) -> Processed:
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
+    if getattr(shared.sd_model, "is_minimax_h3", False):
+        from modules_forge import minimax_h3
+
+        return minimax_h3.process_images(p)
+
     _times = 1
     _is_video = False
     video_path = None

@@ -820,6 +820,12 @@ def split_state_dict(path: os.PathLike, additional_state_dicts: list[os.PathLike
 
 @torch.inference_mode()
 def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = None) -> "ForgeDiffusionEngine":
+    from backend.diffusion_engine.minimax_h3 import is_minimax_h3, load_minimax_h3
+
+    if is_minimax_h3(sd):
+        backend.args.dynamic_args.reset()
+        return load_minimax_h3(sd, additional_state_dicts=additional_state_dicts)
+
     state_dicts, estimated_config = split_state_dict(sd, additional_state_dicts=additional_state_dicts)
     repo_name: str = estimated_config.huggingface_repo
 
