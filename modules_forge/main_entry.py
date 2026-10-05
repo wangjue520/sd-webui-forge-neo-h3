@@ -237,6 +237,8 @@ def forge_main_entry():
     ui_txt2img_batch_size = get_a1111_ui_component("txt2img", "Batch size")
     ui_img2img_batch_size = get_a1111_ui_component("img2img", "Batch size")
 
+    from modules_forge import minimax_h3
+
     output_targets = [
         ui_checkpoint,
         ui_vae,
@@ -262,6 +264,7 @@ def forge_main_entry():
         ui_img2img_batch_size,
         ui_h3_references,
         ui_img2img_tab or gr.State(None),
+        *minimax_h3.ui_panels,
     ]
 
     ui_forge_preset.change(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False).success(
@@ -282,6 +285,8 @@ def _load_presets(ui_checkpoint: str, ui_vae: list[str], ui_forge_unet_dtype: st
 
 
 def on_preset_change(preset: str):
+    from modules_forge import minimax_h3
+
     assert preset is not None
     shared.opts.set("forge_preset", preset)
     shared.opts.save(shared.config_filename)
@@ -334,4 +339,6 @@ def on_preset_change(preset: str):
         # ui_h3_references, ui_img2img_tab
         gr.update(visible=preset == PresetArch.h3.name),
         gr.update(label="img2video" if preset == PresetArch.h3.name else "img2img") if ui_img2img_tab is not None else gr.skip(),
+        # MiniMax-H3 Video panels
+        *[gr.update(visible=preset == PresetArch.h3.name) for _ in minimax_h3.ui_panels],
     ]

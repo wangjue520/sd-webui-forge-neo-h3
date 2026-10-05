@@ -212,6 +212,7 @@ def load_transformer(path: str):
     model = _build(lambda: MiniMaxH3Model(**config, dtype=None, operations=ops), sd, storage_dtype, quant_config, compute_dtype, memory_management.cpu, "Transformer")
     model.computation_dtype = compute_dtype
     model.storage_dtype = storage_dtype
+    model.quantized = storage_dtype == "gguf" or quant_config is not None
     return model
 
 
@@ -314,6 +315,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         load_device = memory_management.get_torch_device()
         self.transformer = ModelPatcher(transformer, load_device=load_device, offload_device=memory_management.unet_offload_device())
+        self.transformer_original = self.transformer
+        self.lora_hash = str([])
         self.text_encoder = ModelPatcher(text_encoder, load_device=memory_management.text_encoder_device(), offload_device=memory_management.text_encoder_offload_device())
         self.vae = ModelPatcher(vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
         self.audio_vae = None if audio_vae is None else ModelPatcher(audio_vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
@@ -332,6 +335,49 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
     def set_shift(self, shift: float):
         self.shift = float(shift)
+
+    # region LoRA
+
+    def _lora_key_map(self) -> dict[str, str]:
+        key_map = {}
+        for k in self.transformer_original.model.state_dict().keys():
+            if not k.endswith(".weight"):
+                continue
+            base = k[: -len(".weight")]
+            for prefix in ("diffusion_model.", "model.diffusion_model.", "transformer.", ""):
+                key_map[prefix + base] = k
+            key_map["lora_unet_" + base.replace(".", "_")] = k
+        return key_map
+
+    def set_loras(self, loras: list[tuple[str, float]]):
+        """loras: [(path, strength)]; ComfyUI-format MiniMax-H3 LoRAs (e.g. lightx2v Turbo *_comfyui_*.safetensors)"""
+        from modules_forge.packages.comfy.lora import load_lora
+
+        lora_hash = str([(os.path.abspath(p), float(w)) for p, w in loras])
+        if lora_hash == self.lora_hash:
+            return
+        self.lora_hash = lora_hash
+
+        patcher = self.transformer_original.clone() if loras else self.transformer_original
+        dit = self.transformer_original.model
+        online = getattr(dit, "quantized", False)
+        key_map = self._lora_key_map()
+
+        for path, strength in loras:
+            lora_sd = utils.load_torch_file(path)
+            patches, unmatched = load_lora(lora_sd, key_map)
+            if unmatched:
+                logger.info(f"LoRA \"{os.path.basename(path)}\": {len(unmatched)} unmatched keys")
+            loaded = patcher.add_patches(patches, float(strength), filename=path, online_mode=online)
+            if len(loaded) == 0:
+                logger.warning(f'LoRA "{os.path.basename(path)}" matched no MiniMax-H3 weights (use the ComfyUI-format file)')
+            else:
+                logger.info(f'Loaded LoRA "{os.path.basename(path)}" ({len(loaded)} weights, strength {strength}, online: {online})')
+            del lora_sd
+
+        self.transformer = patcher
+        self.forge_objects.unet = patcher
+        self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
 
     def get_learned_conditioning(self, prompt: list[str]):
         raise NotImplementedError("MiniMax-H3 runs through modules_forge.minimax_h3")
@@ -426,6 +472,11 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 resized = resize_image(img, tw, th, crop=False)
                 pictures.append(resized)
                 refs.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "ref_audio_t": 0, "latent": None, "_image": resized})
+            # keyframes on top of references (ComfyUI's MiniMaxH3AddGuide): latent-only guides, not shown to Qwen
+            if first_frame is not None:
+                keyframes.append({"resolved_frame_index": 0, "_image": resize_image(first_frame, width, height, crop=True)})
+            if last_frame is not None:
+                keyframes.append({"resolved_frame_index": frame_count - 1, "_image": resize_image(last_frame, width, height, crop=True)})
         else:
             if first_frame is not None:
                 img = resize_image(first_frame, width, height, crop=False)

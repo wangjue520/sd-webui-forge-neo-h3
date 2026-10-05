@@ -66,7 +66,7 @@ STEPS = {
     PresetArch.ernie: 8,
     PresetArch.pid: 4,
     PresetArch.krea: 8,
-    PresetArch.h3: 30,
+    PresetArch.h3: 20,
 }
 
 CFG = {
