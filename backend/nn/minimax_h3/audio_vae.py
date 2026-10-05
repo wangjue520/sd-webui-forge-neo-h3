@@ -15,9 +15,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from backend.nn.minimax_h3._compat import cast_bias_weight, cast_to_input
-from backend.operations import ForgeOperations
+from backend.nn.minimax_h3._compat import ops as _ops
 
-ops = ForgeOperations
+
+ops = _ops  # torch.nn resolved at construction time (Forge ops where available, e.g. not ConvTranspose1d)
 
 
 # Snake activations
