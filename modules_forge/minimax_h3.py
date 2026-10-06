@@ -279,6 +279,14 @@ def process_images(p) -> "Processed":
             ref_audios.append(waveform)
         else:
             print(f"[MiniMax-H3] failed to read reference audio {path}")
+    guides = []
+    for path, seconds in options.get("guides", []):
+        try:
+            guides.append((round(float(seconds) * FPS), _to_tensor(Image.open(path))))
+        except Exception as e:
+            print(f"[MiniMax-H3] failed to read frame guide {path}: {e}")
+    if guides:
+        p.extra_generation_params["Frame Guides"] = ", ".join(f"{s}s" for _, s in options["guides"])
     if ref_videos:
         p.extra_generation_params["Reference Videos"] = len(ref_videos)
     if ref_audios:
@@ -357,6 +365,7 @@ def process_images(p) -> "Processed":
                 preview=_preview if opts.live_previews_enable else None,
                 ref_videos=ref_videos,
                 ref_audios=ref_audios,
+                guides=guides if i == 0 else None,  # guide times refer to the first segment
             )
 
             # the first frame of a continuation repeats the previous segment's last frame

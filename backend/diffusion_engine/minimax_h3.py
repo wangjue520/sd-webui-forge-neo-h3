@@ -836,15 +836,16 @@ class MiniMaxH3(ForgeDiffusionEngine):
         preview: Callable = None,
         ref_videos: list[dict] = None,
         ref_audios: list[torch.Tensor] = None,
+        guides: list[tuple[int, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
         """
         with vram_cap():
-            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios)
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios, guides)
 
-    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None):
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None, guides=None):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -913,6 +914,14 @@ class MiniMaxH3(ForgeDiffusionEngine):
         logger.info(f"[MiniMax-H3] {width}x{height} | {frame_count} frames ({frame_count / FPS:.2f}s) | {steps} steps | {sampler} | shift {self.shift}")
 
         timer = _StageTimer()
+        # frame guides (ComfyUI's MiniMaxH3AddGuide): latent-only anchors at any frame, cover-cropped to the canvas
+        for frame_index, image in guides or []:
+            index = int(frame_index) if frame_index >= 0 else frame_count + int(frame_index)
+            index = max(0, min(frame_count - 1, index))
+            keyframes.append({"resolved_frame_index": index, "_image": resize_image(image, width, height, crop=True)})
+        if guides:
+            logger.info(f"[MiniMax-H3] frame guides at {sorted(k['resolved_frame_index'] for k in keyframes)}")
+
         text_states, tags = self.encode_prompt(prompt, pictures, ref_items=ref_items if (ref_videos or ref_audios) else None)
         timer("text encoder")
 

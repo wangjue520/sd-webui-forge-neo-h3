@@ -83,6 +83,11 @@ class MiniMaxH3Video(scripts.Script):
                 keyframes = gr.File(label="Keyframes (按文件名排序)", file_count="multiple", file_types=["image"], type="filepath", height=96)
                 segment_prompts = gr.Textbox(label="Segment Prompts (每行一段，留空则用主提示词)", lines=3)
 
+            with gr.Tab("中间帧引导 / Frame Guides"):
+                gr.Markdown("在任意时间点放置画面锚点（ComfyUI 的 AddGuide）：上传图片（按文件名排序），并填写对应的秒数（逗号分隔，可用负数表示从结尾倒数）。可与首帧 / 尾帧 / 参考图同时使用。")
+                guide_files = gr.File(label="Guide Images", file_count="multiple", file_types=["image"], type="filepath", height=96)
+                guide_times = gr.Textbox(label="Times (seconds)", placeholder="例如: 1.0, 2.5, -0.5", lines=1)
+
             with gr.Tab("Turbo 加速"):
                 gr.Markdown("lightx2v Turbo LoRA（请使用 *_comfyui_* 格式文件，放在 models/Lora）。推荐 8 步 / Shift 6。")
                 with gr.Row():
@@ -101,11 +106,16 @@ class MiniMaxH3Video(scripts.Script):
                     upscale_by = gr.Slider(label="Scale", minimum=1.0, maximum=4.0, step=0.25, value=2.0)
 
         minimax_h3.ui_panels.append(panel)
-        return [keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by]
+        return [keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files, guide_times]
 
-    def before_process(self, p, keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, *args, **kwargs):
+    def before_process(self, p, keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files=None, guide_times="", *args, **kwargs):
+        files = sorted(guide_files or [])
+        times = [t.strip() for t in (guide_times or "").replace("，", ",").split(",") if t.strip()]
+        if files and len(times) != len(files):
+            raise ValueError(f"Frame Guides: {len(files)} image(s) but {len(times)} time(s)")
         _options(p).update(
             {
+                "guides": list(zip(files, [float(t) for t in times])),
                 "keyframes": sorted(keyframes or []),
                 "segment_prompts": [x.strip() for x in (segment_prompts or "").splitlines() if x.strip()],
                 "turbo": bool(turbo),
