@@ -308,6 +308,48 @@ def load_minimax_h3(path: str, additional_state_dicts: list[str] = None) -> "Min
     return MiniMaxH3(transformer, text_encoder, vae, audio_vae, is_ref2va="ref" in os.path.basename(path).lower())
 
 
+# region VRAM
+
+
+_BASE_RESERVED_VRAM: int = None
+
+
+def _external_vram(device: torch.device) -> int:
+    """VRAM used by other processes (another WebUI, games...); torch.cuda.mem_get_info misses it on Windows (WDDM)"""
+    if getattr(memory_management, "PYNVML_IS_AVAILABLE", False) or device.type != "cuda":
+        return 0  # Forge already accounts for it (--pynvml)
+    import subprocess
+
+    try:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", str(index)], capture_output=True, text=True, timeout=10)
+        used = int(out.stdout.strip().splitlines()[0]) * 2**20
+    except Exception:
+        return 0
+    return max(0, used - torch.cuda.memory_reserved(device))
+
+
+def load_gpu(patcher: ModelPatcher):
+    """load_model_gpu, reserving the VRAM other processes use so that Forge offloads (streams) instead of
+    oversubscribing into Windows' shared GPU memory, which makes the 17 GB text encoder and the DiT 10-100x slower"""
+    global _BASE_RESERVED_VRAM
+    # H3 runs its huge components one after another (TE 17 GB -> DiT 11 GB -> VAE 5 GB); Forge's policy partially
+    # loads the next one instead of evicting the previous, which ends up oversubscribing VRAM; so evict explicitly
+    if not any(m.model is patcher for m in memory_management.current_loaded_models):
+        memory_management.unload_all_models()
+        memory_management.soft_empty_cache()
+    if _BASE_RESERVED_VRAM is None:
+        _BASE_RESERVED_VRAM = memory_management.EXTRA_RESERVED_VRAM
+    external = _external_vram(patcher.load_device)
+    memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM + external
+    if external > 512 * 2**20:
+        logger.info(f"{external / 2**30:.1f} GiB VRAM is used by other processes; reserving it")
+    try:
+        memory_management.load_model_gpu(patcher)
+    finally:
+        memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM
+
+
 # region Engine
 
 
@@ -471,7 +513,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 entries += [VISION_START, {"data": img.unsqueeze(0).float(), "video_block": False}, VISION_END]
         entries += self._tokens(prompt)
 
-        memory_management.load_model_gpu(self.text_encoder)
+        load_gpu(self.text_encoder)
         device = self.text_encoder.load_device
         hidden, tags = te.encode(entries, device)
         return hidden.cpu(), tags
@@ -479,7 +521,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
     @torch.inference_mode()
     def vae_encode(self, image: torch.Tensor) -> torch.Tensor:
         """[H, W, C] in [0, 1] -> normalized latent [1, 24, 1, H/16, W/16]"""
-        memory_management.load_model_gpu(self.vae)
+        load_gpu(self.vae)
         model = self.vae.model
         x = image.movedim(-1, 0).unsqueeze(0).unsqueeze(2).mul(2.0).sub(1.0)
         x = x.to(device=self.vae.load_device, dtype=model.dtype)
@@ -488,7 +530,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
     @torch.inference_mode()
     def vae_decode(self, z: torch.Tensor) -> torch.Tensor:
         """normalized latent -> [F, H, W, C] float in [0, 1] (cpu)"""
-        memory_management.load_model_gpu(self.vae)
+        load_gpu(self.vae)
         model = self.vae.model
         out = model.decode(z.to(device=self.vae.load_device, dtype=model.dtype))
         return out[0].float().movedim(0, -1).cpu()
@@ -497,7 +539,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
     def audio_decode(self, z: torch.Tensor) -> torch.Tensor | None:
         if self.audio_vae is None:
             return None
-        memory_management.load_model_gpu(self.audio_vae)
+        load_gpu(self.audio_vae)
         return self.audio_vae.model.decode(z.to(device=self.audio_vae.load_device, dtype=torch.float32)).float().cpu()
 
     # region Generation
@@ -578,7 +620,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         x_video = torch.randn((1, 24, latent_t, height // 16, width // 16), generator=generator, dtype=torch.float32)
         x_audio = torch.randn((1, 32, 2, audio_t), generator=generator, dtype=torch.float32)
 
-        memory_management.load_model_gpu(self.transformer)
+        load_gpu(self.transformer)
         device = self.transformer.load_device
         dit = self.transformer.model
         dtype = dit.computation_dtype
