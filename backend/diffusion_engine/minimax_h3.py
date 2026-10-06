@@ -139,9 +139,19 @@ def _materialize(sd: dict):
     between generations and every reload of the text encoder / DiT re-reads the disk at ~1 GB/s (20+ s per generation)
     instead of copying RAM -> VRAM at ~9 GB/s
     """
-    for k, v in sd.items():
-        if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-            v.data = v.data.clone()
+    import psutil
+
+    # only GGUF (numpy memmap); safetensors / mixed-precision files are left to Forge, and only with RAM to spare
+    tensors = [v for v in sd.values() if isinstance(v, torch.Tensor) and v.device.type == "cpu" and getattr(v, "gguf_cls", None) is not None]
+    size = sum(v.numel() * v.element_size() for v in tensors)
+    available = psutil.virtual_memory().available
+    if size == 0:
+        return
+    if available < size * 1.5 + 8 * 2**30:
+        logger.warning(f"not enough free RAM to cache {size / 2**30:.1f} GB of GGUF weights ({available / 2**30:.1f} GB free); reloads will read the disk")
+        return
+    for v in tensors:
+        v.data = v.data.clone()
 
 
 def _storage(sd: dict, default: torch.dtype, is_unet: bool = False):
