@@ -237,6 +237,9 @@ def process_images(p) -> "Processed":
     video_path = None
     samples_per_frame = AUDIO_SAMPLE_RATE / FPS
 
+    def _preview(image):
+        shared.state.assign_current_image(image)
+
     def callback(step: int, total: int) -> bool:
         state.sampling_steps = total
         state.sampling_step = step
@@ -285,6 +288,7 @@ def process_images(p) -> "Processed":
                 references=references,
                 callback=callback,
                 sampler=p.sampler_name,
+                preview=_preview if opts.live_previews_enable else None,
             )
 
             # the first frame of a continuation repeats the previous segment's last frame

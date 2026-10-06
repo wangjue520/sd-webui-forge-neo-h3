@@ -462,6 +462,32 @@ def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
         memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM
 
 
+# https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/latent_formats.py (MiniMaxH3Video)
+LATENT_RGB_FACTORS = [
+    [-0.018555, 0.024344, -0.017536], [0.150164, 0.137244, 0.129221], [0.027367, -0.050369, -0.208606], [-0.000793, -0.164622, -0.323161],
+    [-0.048556, 0.013970, -0.074286], [0.011740, 0.014172, -0.006906], [0.061517, 0.061212, 0.110025], [0.035321, 0.086879, 0.110059],
+    [-0.017426, 0.002997, 0.035356], [0.531539, 0.548819, 0.624404], [-0.024968, -0.040234, -0.034302], [-0.032549, -0.029096, -0.017221],
+    [0.022609, 0.020286, 0.050661], [-0.084001, -0.038131, -0.020805], [-0.018830, 0.010412, 0.061120], [0.020777, 0.011196, -0.030994],
+    [-0.008390, -0.012201, -0.025687], [-0.013281, -0.002924, 0.006331], [0.000260, 0.001833, -0.011038], [0.105471, 0.100482, 0.132106],
+    [0.016529, 0.015213, 0.009999], [-0.014015, -0.017438, -0.019134], [-0.033787, -0.009984, -0.019725], [0.004224, 0.017284, 0.027196],
+]
+LATENT_RGB_BIAS = [0.057426, -0.022078, -0.071449]
+
+
+def latent_preview(latent: torch.Tensor, scale: int = 8):
+    """[1, 24, T, h, w] normalized latent -> PIL strip of the first / middle / last latent frame (linear approximation)"""
+    from PIL import Image
+
+    z = latent[0].float()
+    frames = sorted({0, z.shape[1] // 2, z.shape[1] - 1})
+    factors = torch.tensor(LATENT_RGB_FACTORS, device=z.device, dtype=torch.float32)
+    bias = torch.tensor(LATENT_RGB_BIAS, device=z.device, dtype=torch.float32)
+    rgb = [torch.einsum("chw,cr->hwr", z[:, t], factors) + bias for t in frames]
+    strip = torch.cat(rgb, dim=1).add(1.0).mul(127.5).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    img = Image.fromarray(strip)
+    return img.resize((img.width * scale, img.height * scale), Image.Resampling.BILINEAR)
+
+
 class FlowSampler:
     """
     one stream (video or audio) on its own sigma schedule; denoised = x - sigma * v
@@ -765,15 +791,16 @@ class MiniMaxH3(ForgeDiffusionEngine):
         references: list[torch.Tensor] = None,
         callback: Callable[[int, int], bool] = None,
         sampler: str = "Euler",
+        preview: Callable = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
         """
         with vram_cap():
-            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler)
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview)
 
-    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler"):
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -883,6 +910,11 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 raise RuntimeError(f"MiniMax-H3 produced NaN / Inf at step {i + 1} (try fewer / more steps, another shift, or a less aggressive quantization)")
             x_video = video_sampler.step(i, x_video, out_v.float())
             x_audio = audio_sampler.step(i, x_audio, out_a.float())
+            if preview is not None:
+                try:
+                    preview(latent_preview(video_sampler.old_denoised))
+                except Exception as e:
+                    logger.debug(f"preview failed: {e}")
 
         if callback is not None:
             callback(int(steps), int(steps))
