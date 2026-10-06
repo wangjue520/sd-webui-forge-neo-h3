@@ -34,7 +34,7 @@ SAMPLERS = {
     PresetArch.ernie: "Euler",
     PresetArch.pid: "LCM",
     PresetArch.krea: "Euler",
-    PresetArch.h3: "Euler",
+    PresetArch.h3: "Res Multistep",
 }
 
 SCHEDULERS = {

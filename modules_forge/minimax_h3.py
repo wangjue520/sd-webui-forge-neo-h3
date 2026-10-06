@@ -284,6 +284,7 @@ def process_images(p) -> "Processed":
                 last_frame=end,
                 references=references,
                 callback=callback,
+                sampler=p.sampler_name,
             )
 
             # the first frame of a continuation repeats the previous segment's last frame

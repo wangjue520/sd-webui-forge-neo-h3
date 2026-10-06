@@ -462,6 +462,48 @@ def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
         memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM
 
 
+class FlowSampler:
+    """
+    one stream (video or audio) on its own sigma schedule; denoised = x - sigma * v
+    https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/k_diffusion/sampling.py (sample_euler / sample_res_multistep / sample_dpmpp_2m)
+    the exponential-integrator updates are exact for rectified flow too: x_next = (s_next / s) x + (1 - s_next / s) x0
+    """
+
+    NAMES = {"Euler": "euler", "Res Multistep": "res_multistep", "DPM++ 2M": "dpmpp_2m"}
+
+    def __init__(self, name: str, sigmas: torch.Tensor):
+        self.kind = self.NAMES.get(name, "euler")
+        self.sigmas = sigmas.double()
+        self.old_denoised = None
+
+    @staticmethod
+    def t_fn(sigma):
+        return sigma.log().neg()
+
+    def step(self, i: int, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        s, s_next = self.sigmas[i], self.sigmas[i + 1]
+        denoised = x - float(s) * v
+        if self.kind == "euler" or self.old_denoised is None or s_next == 0:
+            x = x + float(s_next - s) * v
+        elif self.kind == "res_multistep":
+            t, t_next, t_prev = self.t_fn(s), self.t_fn(s_next), self.t_fn(self.sigmas[i - 1])
+            h = t_next - t
+            c2 = (t_prev - t) / h  # eta = 0: the previous sigma_down is sigmas[i]
+            phi1 = torch.expm1(-h) / -h
+            phi2 = (phi1 - 1.0) / -h
+            b1 = float(torch.nan_to_num(phi1 - phi2 / c2, nan=0.0))
+            b2 = float(torch.nan_to_num(phi2 / c2, nan=0.0))
+            x = float((-h).exp()) * x + float(h) * (b1 * denoised + b2 * self.old_denoised)
+        else:  # dpmpp_2m
+            t, t_next = self.t_fn(s), self.t_fn(s_next)
+            h = t_next - t
+            r = (t - self.t_fn(self.sigmas[i - 1])) / h
+            denoised_d = (1 + 1 / (2 * float(r))) * denoised - (1 / (2 * float(r))) * self.old_denoised
+            x = float(s_next / s) * x - float(torch.expm1(-h)) * denoised_d
+        self.old_denoised = denoised
+        return x
+
+
 class _StageTimer:
     def __init__(self):
         import time
@@ -722,15 +764,16 @@ class MiniMaxH3(ForgeDiffusionEngine):
         last_frame: torch.Tensor = None,
         references: list[torch.Tensor] = None,
         callback: Callable[[int, int], bool] = None,
+        sampler: str = "Euler",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
         """
         with vram_cap():
-            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback)
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler)
 
-    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback):
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler"):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -767,7 +810,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
             mode = {(False, False): "Text-to-Video", (True, False): "Image-to-Video", (False, True): "LastFrame-to-Video", (True, True): "FirstLastFrame-to-Video"}
             logger.info(f"[MiniMax-H3] {mode[(first_frame is not None, last_frame is not None)]}")
 
-        logger.info(f"[MiniMax-H3] {width}x{height} | {frame_count} frames ({frame_count / FPS:.2f}s) | {steps} steps | shift {self.shift}")
+        logger.info(f"[MiniMax-H3] {width}x{height} | {frame_count} frames ({frame_count / FPS:.2f}s) | {steps} steps | {sampler} | shift {self.shift}")
 
         timer = _StageTimer()
         text_states, tags = self.encode_prompt(prompt, pictures)
@@ -811,6 +854,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
         sigmas_a = time_shift(base, shift_a)
         transformer_options = {"sample_sigmas": sigmas_v, "minimax_h3_sigma_shift_video": shift_v, "minimax_h3_sigma_shift_audio": shift_a}
 
+        video_sampler, audio_sampler = FlowSampler(sampler, sigmas_v), FlowSampler(sampler, sigmas_a)
+        if sampler not in FlowSampler.NAMES:
+            logger.warning(f'[MiniMax-H3] sampler "{sampler}" is not supported; using Euler (supported: {", ".join(FlowSampler.NAMES)})')
         for i in range(int(steps)):
             if callback is not None and callback(i, int(steps)):
                 break
@@ -835,8 +881,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
             # Euler on the rectified flow: x0 = x - sigma * v
             if not (torch.isfinite(out_v).all() and torch.isfinite(out_a).all()):
                 raise RuntimeError(f"MiniMax-H3 produced NaN / Inf at step {i + 1} (try fewer / more steps, another shift, or a less aggressive quantization)")
-            x_video = x_video + (sv_next - sv).item() * out_v.float()
-            x_audio = x_audio + (sa_next - sa).item() * out_a.float()
+            x_video = video_sampler.step(i, x_video, out_v.float())
+            x_audio = audio_sampler.step(i, x_audio, out_a.float())
 
         if callback is not None:
             callback(int(steps), int(steps))
