@@ -364,18 +364,24 @@ class _FileBackedPatcher(ModelPatcher):
         for module_name, module in model.named_modules():
             for name, t in list(module._parameters.items()) + list(module._buffers.items()):
                 if t is not None and t.device.type == "cpu":
-                    self._originals[(module_name, name)] = t
+                    # keep the CPU storage too: nn.Module._apply moves ordinary parameters in place (param.data = ...),
+                    # so the object alone would follow the weights onto the GPU (GGUF parameters are replaced instead)
+                    self._originals[(module_name, name)] = (t, t.data)
 
     def _restore_originals(self):
         modules = dict(self.model.named_modules())
-        for (module_name, name), t in self._originals.items():
+        for (module_name, name), (t, data) in self._originals.items():
             module = modules.get(module_name, None)
             if module is None:
                 continue
+            if t.data.data_ptr() != data.data_ptr():
+                t.data = data
             if name in module._parameters:
                 module._parameters[name] = t
             elif name in module._buffers:
                 module._buffers[name] = t
+        # the original GGUF tensors are unbaked: let the next load bake its fresh GPU copies again
+        self.model.gguf_baked = False
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         if unpatch_weights and device_to is not None and torch.device(device_to).type == "cpu" and self._originals and not self.backup:
@@ -408,6 +414,28 @@ def _external_vram(device: torch.device) -> int:
     except Exception:
         return 0
     return max(0, used - torch.cuda.memory_reserved(device))
+
+
+class vram_cap:
+    """
+    cap PyTorch's allocator at the physical VRAM left by other processes while H3 runs: GGUF dequant temporaries of
+    many sizes fragment the caching allocator (16.7 GB used, 22.5 GB reserved), and on Windows (WDDM) going past the
+    physical VRAM silently pages into system RAM (12 s -> 110 s per step) instead of raising OOM; with a cap the
+    allocator frees its cache and retries first
+    """
+
+    def __enter__(self):
+        self.device = memory_management.get_torch_device()
+        if self.device.type != "cuda":
+            return self
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        usable = total - _external_vram(self.device) - 512 * 2**20
+        torch.cuda.set_per_process_memory_fraction(max(0.5, min(1.0, usable / total)), self.device)
+        return self
+
+    def __exit__(self, *args):
+        if self.device.type == "cuda":
+            torch.cuda.set_per_process_memory_fraction(1.0, self.device)
 
 
 def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
@@ -451,6 +479,24 @@ class _StageTimer:
 
     def summary(self) -> str:
         return " | ".join(f"{n} {t:.1f}s" for n, t in self.stages if t >= 0.05) + f" | total {self.last - self.start:.1f}s"
+
+
+def run_on_gpu(patcher: ModelPatcher, fn: Callable, inference_memory: float = 0, stage: str = ""):
+    """
+    load_gpu + fn(); self-heal on CUDA OOM: free the cache, reload with twice the activation reserve
+    (Forge then streams more of the weights) and retry, up to 2 times
+    """
+    for attempt in range(3):
+        try:
+            load_gpu(patcher, inference_memory=inference_memory)
+            return fn()
+        except torch.OutOfMemoryError:
+            if attempt == 2:
+                raise
+            inference_memory = max(inference_memory * 2, 4 * 2**30)
+            logger.warning(f"[Self-heal] out of VRAM in {stage or type(patcher.model).__name__}; reloading with {inference_memory / 2**30:.1f} GB reserved and retrying")
+            memory_management.unload_all_models()
+            torch.cuda.empty_cache()
 
 
 # region Engine
@@ -620,9 +666,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 entries += [VISION_START, {"data": img.unsqueeze(0).float(), "video_block": False}, VISION_END]
         entries += self._tokens(prompt)
 
-        load_gpu(self.text_encoder, inference_memory=1.5 * 2**30)  # bf16, ~1 GB transient: fits 24 GB entirely
         device = self.text_encoder.load_device
-        hidden, tags = te.encode(entries, device)
+        # bf16, ~1 GB transient (more with reference images / videos for the vision tower)
+        hidden, tags = run_on_gpu(self.text_encoder, lambda: te.encode(entries, device), inference_memory=1.5 * 2**30, stage="text encoder")
         if not torch.isfinite(hidden).all():
             logger.warning("[Self-heal] NaN / Inf in the text encoder output; re-encoding in fp32")
             hidden, tags = te.encode(entries, device, dtype=torch.float32)
@@ -633,19 +679,16 @@ class MiniMaxH3(ForgeDiffusionEngine):
     @torch.inference_mode()
     def vae_encode(self, image: torch.Tensor) -> torch.Tensor:
         """[H, W, C] in [0, 1] -> normalized latent [1, 24, 1, H/16, W/16]"""
-        load_gpu(self.vae)
         model = self.vae.model
         x = image.movedim(-1, 0).unsqueeze(0).unsqueeze(2).mul(2.0).sub(1.0)
-        x = x.to(device=self.vae.load_device, dtype=model.dtype)
-        return model.encode(x).float().cpu()
+        return run_on_gpu(self.vae, lambda: model.encode(x.to(device=self.vae.load_device, dtype=model.dtype)).float().cpu(), inference_memory=2 * 2**30, stage="VAE encode")
 
     @torch.inference_mode()
     def vae_decode(self, z: torch.Tensor) -> torch.Tensor:
         """normalized latent -> [F, H, W, C] float in [0, 1] (cpu)"""
         # measured: ~9 GB of activations decoding a 22-frame chunk in 256 px tiles (batches up to 4 tiles when VRAM allows)
-        load_gpu(self.vae, inference_memory=9 * 2**30)
         model = self.vae.model
-        out = model.decode(z.to(device=self.vae.load_device, dtype=model.dtype))
+        out = run_on_gpu(self.vae, lambda: model.decode(z.to(device=self.vae.load_device, dtype=model.dtype)), inference_memory=9 * 2**30, stage="VAE decode")
         if not torch.isfinite(out).all() and model.dtype != torch.float32:
             logger.warning(f"[Self-heal] NaN / Inf in the VAE decode ({model.dtype}); retrying in fp32")
             original = model.dtype
@@ -662,8 +705,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
     def audio_decode(self, z: torch.Tensor) -> torch.Tensor | None:
         if self.audio_vae is None:
             return None
-        load_gpu(self.audio_vae)
-        return self.audio_vae.model.decode(z.to(device=self.audio_vae.load_device, dtype=torch.float32)).float().cpu()
+        return run_on_gpu(self.audio_vae, lambda: self.audio_vae.model.decode(z.to(device=self.audio_vae.load_device, dtype=torch.float32)).float().cpu(), inference_memory=1 * 2**30, stage="audio decode")
 
     # region Generation
 
@@ -685,6 +727,10 @@ class MiniMaxH3(ForgeDiffusionEngine):
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
         """
+        with vram_cap():
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback)
+
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -748,7 +794,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
         # activations of the packed sequence (hidden 5376, qkv 3x, mlp 2x14336) + a dequantized weight in flight
         tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs)
         timer("vae encode")
-        load_gpu(self.transformer, inference_memory=tokens * (5376 * 2 * 8 + 28672 * 2 * 2) + 2**30)
+        # measured ~1.2 MB of activations (incl. GGUF dequant temporaries) per packed token on a 3090
+        inference_memory = tokens * 1.25 * 2**20 + 2 * 2**30
+        load_gpu(self.transformer, inference_memory=inference_memory)
         timer("load transformer")
         device = self.transformer.load_device
         dit = self.transformer.model
@@ -769,7 +817,21 @@ class MiniMaxH3(ForgeDiffusionEngine):
             sv, sv_next = sigmas_v[i], sigmas_v[i + 1]
             sa, sa_next = sigmas_a[i], sigmas_a[i + 1]
             timestep = (sv * 1000.0).view(1).to(device)
-            out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload)
+            for attempt in range(3):
+                try:
+                    out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload)
+                    break
+                except torch.OutOfMemoryError:
+                    if attempt == 2:
+                        raise
+                    # self-heal: free the cache, reload the DiT with a larger activation reserve (streams more weights)
+                    inference_memory *= 2
+                    logger.warning(f"[Self-heal] out of VRAM at step {i + 1}; reloading the transformer with {inference_memory / 2**30:.1f} GB reserved and retrying")
+                    for adapter in self.lora_adapters:
+                        adapter.cache = None
+                    memory_management.unload_all_models()
+                    torch.cuda.empty_cache()
+                    load_gpu(self.transformer, inference_memory=inference_memory)
             # Euler on the rectified flow: x0 = x - sigma * v
             if not (torch.isfinite(out_v).all() and torch.isfinite(out_a).all()):
                 raise RuntimeError(f"MiniMax-H3 produced NaN / Inf at step {i + 1} (try fewer / more steps, another shift, or a less aggressive quantization)")
