@@ -78,6 +78,9 @@ class MiniMaxQwen3VL(BaseLlama, nn.Module):
             entries = [PAD]
 
         embed_tokens = self.model.embed_tokens
+        embed_cache = getattr(self, "embed_cache", None)
+        # bf16 activations: half the transient memory of fp32 (the 32B conditioner barely fits a 24 GB card)
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
         pieces, embeds_info = [], []
         pending: list[int] = []
         index = 0
@@ -85,8 +88,12 @@ class MiniMaxQwen3VL(BaseLlama, nn.Module):
         def flush():
             nonlocal pending, index
             if pending:
-                ids = torch.tensor([pending], device=device, dtype=torch.long)
-                pieces.append(embed_tokens(ids).to(dtype=torch.float32))
+                if embed_cache is not None:
+                    ids = torch.tensor([pending], dtype=torch.long)
+                    pieces.append(torch.nn.functional.embedding(ids, embed_cache).to(device=device, dtype=dtype))
+                else:
+                    ids = torch.tensor([pending], device=device, dtype=torch.long)
+                    pieces.append(embed_tokens(ids).to(dtype=dtype))
                 index += len(pending)
                 pending = []
 
@@ -96,7 +103,7 @@ class MiniMaxQwen3VL(BaseLlama, nn.Module):
                 continue
             flush()
             merged, grid, deepstack = self.encode_vision(e["data"], e.get("video_block", False), device)
-            merged = merged.view(1, -1, merged.shape[-1]).to(device=device, dtype=torch.float32)
+            merged = merged.view(1, -1, merged.shape[-1]).to(device=device, dtype=dtype)
             embeds_info.append({"type": "image", "index": index, "size": merged.shape[1], "extra": {"grid": grid, "deepstack": deepstack}})
             pieces.append(merged)
             index += merged.shape[1]
@@ -119,5 +126,5 @@ class MiniMaxQwen3VL(BaseLlama, nn.Module):
         for e in embeds_info:
             tags[max(0, e["index"] - 1) : e["index"] + e["size"] + 1] = 0
 
-        out = self.model(None, embeds=embeds, dtype=torch.float32, position_ids=position_ids, deepstack_embeds=deepstack, visual_pos_masks=visual_pos_masks)
+        out = self.model(None, embeds=embeds, dtype=dtype, position_ids=position_ids, deepstack_embeds=deepstack, visual_pos_masks=visual_pos_masks)
         return out[0].float(), tags

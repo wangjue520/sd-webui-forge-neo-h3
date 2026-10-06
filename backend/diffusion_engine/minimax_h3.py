@@ -248,9 +248,26 @@ def load_text_encoder(paths: list[str]):
     storage_dtype, quant_config = _storage(sd, te_dtype)
     model = _build(lambda: MiniMaxQwen3VL(), sd, storage_dtype, quant_config, te_dtype, memory_management.cpu, "TextEncoder")
     model.has_vision = any(k.startswith("visual.blocks.") for k in sd) and any(k.startswith("visual.deepstack_merger_list.") for k in sd)
+    model.embed_cache = _embedding_table(sd.get("model.embed_tokens.weight", None))
     if not model.has_vision:
         logger.warning("[TextEncoder] Qwen3-VL vision tower not found; images will only condition the video latents (not the prompt)")
     return model
+
+
+def _embedding_table(weight) -> torch.Tensor | None:
+    """bf16 copy of the 151936 x 5120 token table on the CPU: Forge's GGUF Embedding would dequantize the whole table on the GPU on every call"""
+    if weight is None:
+        return None
+    try:
+        if getattr(weight, "gguf_cls", None) is not None:
+            from backend.loader_gguf import dequantize
+
+            return dequantize(weight, torch.bfloat16).cpu()
+        if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            return weight.detach().to(torch.bfloat16).cpu()
+    except Exception as e:
+        logger.warning(f"[TextEncoder] embedding cache unavailable: {e}")
+    return None
 
 
 def load_vae(path: str):
@@ -329,7 +346,7 @@ def _external_vram(device: torch.device) -> int:
     return max(0, used - torch.cuda.memory_reserved(device))
 
 
-def load_gpu(patcher: ModelPatcher):
+def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
     """load_model_gpu, reserving the VRAM other processes use so that Forge offloads (streams) instead of
     oversubscribing into Windows' shared GPU memory, which makes the 17 GB text encoder and the DiT 10-100x slower"""
     global _BASE_RESERVED_VRAM
@@ -345,7 +362,8 @@ def load_gpu(patcher: ModelPatcher):
     if external > 512 * 2**20:
         logger.info(f"{external / 2**30:.1f} GiB VRAM is used by other processes; reserving it")
     try:
-        memory_management.load_model_gpu(patcher)
+        # keep `inference_memory` free for activations; Forge streams the rest of the weights if they do not fit
+        memory_management.load_models_gpu([patcher], memory_required=inference_memory)
     finally:
         memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM
 
@@ -513,7 +531,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 entries += [VISION_START, {"data": img.unsqueeze(0).float(), "video_block": False}, VISION_END]
         entries += self._tokens(prompt)
 
-        load_gpu(self.text_encoder)
+        load_gpu(self.text_encoder, inference_memory=4 * 2**30)
         device = self.text_encoder.load_device
         hidden, tags = te.encode(entries, device)
         return hidden.cpu(), tags
@@ -530,7 +548,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
     @torch.inference_mode()
     def vae_decode(self, z: torch.Tensor) -> torch.Tensor:
         """normalized latent -> [F, H, W, C] float in [0, 1] (cpu)"""
-        load_gpu(self.vae)
+        # measured: ~9 GB of activations decoding a 22-frame chunk in 256 px tiles (batches up to 4 tiles when VRAM allows)
+        load_gpu(self.vae, inference_memory=9 * 2**30)
         model = self.vae.model
         out = model.decode(z.to(device=self.vae.load_device, dtype=model.dtype))
         return out[0].float().movedim(0, -1).cpu()
@@ -620,7 +639,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
         x_video = torch.randn((1, 24, latent_t, height // 16, width // 16), generator=generator, dtype=torch.float32)
         x_audio = torch.randn((1, 32, 2, audio_t), generator=generator, dtype=torch.float32)
 
-        load_gpu(self.transformer)
+        # activations of the packed sequence (hidden 5376, qkv 3x, mlp 2x14336) + a dequantized weight in flight
+        tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs)
+        load_gpu(self.transformer, inference_memory=tokens * (5376 * 2 * 8 + 28672 * 2 * 2) + 2**30)
         device = self.transformer.load_device
         dit = self.transformer.model
         dtype = dit.computation_dtype
