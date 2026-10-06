@@ -569,6 +569,11 @@ class MiniMaxH3(ForgeDiffusionEngine):
         load_gpu(self.text_encoder, inference_memory=1.5 * 2**30)  # bf16, ~1 GB transient: fits 24 GB entirely
         device = self.text_encoder.load_device
         hidden, tags = te.encode(entries, device)
+        if not torch.isfinite(hidden).all():
+            logger.warning("[Self-heal] NaN / Inf in the text encoder output; re-encoding in fp32")
+            hidden, tags = te.encode(entries, device, dtype=torch.float32)
+            if not torch.isfinite(hidden).all():
+                raise RuntimeError("MiniMax-H3 text encoder produced NaN / Inf even in fp32 (corrupted text encoder file?)")
         return hidden.cpu(), tags
 
     @torch.inference_mode()
@@ -587,7 +592,17 @@ class MiniMaxH3(ForgeDiffusionEngine):
         load_gpu(self.vae, inference_memory=9 * 2**30)
         model = self.vae.model
         out = model.decode(z.to(device=self.vae.load_device, dtype=model.dtype))
-        return out[0].float().movedim(0, -1).cpu()
+        if not torch.isfinite(out).all() and model.dtype != torch.float32:
+            logger.warning(f"[Self-heal] NaN / Inf in the VAE decode ({model.dtype}); retrying in fp32")
+            original = model.dtype
+            try:
+                model.to(torch.float32)
+                model.dtype = torch.float32
+                out = model.decode(z.to(device=self.vae.load_device, dtype=torch.float32))
+            finally:
+                model.to(original)
+                model.dtype = original
+        return out[0].float().nan_to_num(0.5).movedim(0, -1).cpu()
 
     @torch.inference_mode()
     def audio_decode(self, z: torch.Tensor) -> torch.Tensor | None:
@@ -702,6 +717,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
             timestep = (sv * 1000.0).view(1).to(device)
             out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload)
             # Euler on the rectified flow: x0 = x - sigma * v
+            if not (torch.isfinite(out_v).all() and torch.isfinite(out_a).all()):
+                raise RuntimeError(f"MiniMax-H3 produced NaN / Inf at step {i + 1} (try fewer / more steps, another shift, or a less aggressive quantization)")
             x_video = x_video + (sv_next - sv).item() * out_v.float()
             x_audio = x_audio + (sa_next - sa).item() * out_a.float()
 

@@ -60,7 +60,7 @@ class NansException(Exception):
 
 
 def test_for_nans(x: torch.Tensor, *args, **kwargs):
-    if torch.isnan(x).any():
-        memory_management.logger.warning("Encountered NaN in Latent" + ("; Try --disable-sage" if memory_management.sage_enabled() else ""))
+    if not torch.isfinite(x).all():
+        memory_management.logger.warning("Encountered NaN / Inf in Latent" + ("; Try --disable-sage" if memory_management.sage_enabled() else ""))
         x.nan_to_num_(nan=0.0, posinf=1.0, neginf=0.0)
         # raise NansException

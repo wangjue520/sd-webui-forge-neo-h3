@@ -69,7 +69,7 @@ class MiniMaxQwen3VL(BaseLlama, nn.Module):
         return merged, grid, deepstack
 
     @torch.inference_mode()
-    def encode(self, entries: list, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, entries: list, device: torch.device, dtype: torch.dtype = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         entries: list of token ids (int) and vision dicts {"data": [T, H, W, C] in [0, 1], "video_block": bool}
         returns: (hidden state after layer 50 [1, S, 5120], token tags [S])
@@ -80,7 +80,8 @@ class MiniMaxQwen3VL(BaseLlama, nn.Module):
         embed_tokens = self.model.embed_tokens
         embed_cache = getattr(self, "embed_cache", None)
         # bf16 activations: half the transient memory of fp32 (the 32B conditioner barely fits a 24 GB card)
-        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+        if dtype is None:
+            dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
         pieces, embeds_info = [], []
         pending: list[int] = []
         index = 0

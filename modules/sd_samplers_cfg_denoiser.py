@@ -168,6 +168,9 @@ class CFGDenoiser(torch.nn.Module):
 
         sd_samplers_common.store_latent(denoised.detach().clone())
 
+        from modules_forge import self_heal
+
+        self_heal.check(denoised, f"sampling step {self.step + 1}")
         self.step += 1
 
         if self.classic_ddim_eps_estimation:

@@ -14,6 +14,14 @@ def register(options_templates, options_section, OptionInfo):
     )
     options_templates.update(
         options_section(
+            ("forge_self_heal", "Self-Heal", "sd"),
+            {
+                "forge_self_heal": OptionInfo(True, "Self-heal NaN / Inf (black or garbled images)").info("check every sampling step; on overflow retry with fp32 attention, then with a reloaded model; retry the VAE decode in fp32. Recorded as \"Self-heal\" in the generation parameters"),
+            },
+        )
+    )
+    options_templates.update(
+        options_section(
             ("ui_forgecanvas", "Forge Canvas", "ui"),
             {
                 "forge_canvas_height": OptionInfo(512, "Canvas Height").info("in pixels").needs_reload_ui(),

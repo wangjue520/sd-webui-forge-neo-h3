@@ -609,9 +609,12 @@ class DecodedSamples(list):
     already_decoded = True
 
 
-def decode_latent_batch(model, batch, target_device=None, check_for_nans=False):
+def decode_latent_batch(model, batch, target_device=None, check_for_nans=False, p=None):
+    from modules_forge import self_heal
+
     samples = DecodedSamples()
-    samples_pytorch = decode_first_stage(model, batch).to(target_device)
+    # NaN / Inf from the VAE (fp16 overflow -> black image): retry in fp32
+    samples_pytorch = self_heal.decode(p, model, batch, decode_first_stage).to(target_device)
 
     for x in samples_pytorch:
         samples.append(x)
@@ -995,7 +998,13 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 sigmas_backup = p.sd_model.forge_objects.unet.model.predictor.sigmas
                 p.sd_model.forge_objects.unet.model.predictor.set_sigmas(rescale_zero_terminal_snr_sigmas(p.sd_model.forge_objects.unet.model.predictor.sigmas))
 
-            samples_ddim = p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts)
+            from modules_forge import self_heal
+
+            def _reset_rng():
+                p.rng = rng.ImageRNG(_shape, p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, seed_resize_from_h=p.seed_resize_from_h, seed_resize_from_w=p.seed_resize_from_w)
+
+            # NaN / Inf during sampling: retry with fp32 attention, then with a reloaded model (instead of a black image)
+            samples_ddim = self_heal.sample(p, lambda: p.sample(conditioning=p.c, unconditional_conditioning=p.uc, seeds=p.seeds, subseeds=p.subseeds, subseed_strength=p.subseed_strength, prompts=p.prompts), reset_rng=_reset_rng)
 
             for x_sample in samples_ddim:
                 p.latents_after_sampling.append(x_sample)
@@ -1013,7 +1022,7 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
             else:
                 if opts.sd_vae_decode_method != "Full":
                     p.extra_generation_params["VAE Decoder"] = opts.sd_vae_decode_method
-                x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True)
+                x_samples_ddim = decode_latent_batch(p.sd_model, samples_ddim, target_device=devices.cpu, check_for_nans=True, p=p)
 
             x_samples_ddim = torch.stack(x_samples_ddim).float()
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
