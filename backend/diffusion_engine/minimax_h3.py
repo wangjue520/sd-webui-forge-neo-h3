@@ -128,7 +128,8 @@ def classify_module(path: str) -> str | None:
 
 def _load_sd(path: str) -> tuple[dict, dict]:
     sd, metadata = utils.load_torch_file(path, return_metadata=True)
-    _materialize(sd)
+    if os.environ.get("H3_CACHE_WEIGHTS_IN_RAM", "0") == "1":  # opt-in: faster reloads, needs ~30 GB extra RAM
+        _materialize(sd)
     sd, metadata = convert_quantization(sd, metadata)
     return sd, metadata or {}
 
@@ -350,6 +351,47 @@ def load_minimax_h3(path: str, additional_state_dicts: list[str] = None) -> "Min
 # region VRAM
 
 
+class _FileBackedPatcher(ModelPatcher):
+    """
+    offloading to the CPU re-attaches the original (memory-mapped / already resident) weights instead of copying
+    the GPU weights back into fresh RAM: Forge's model.to("cpu") made a second full copy of each 5-17 GB component,
+    which is what exhausted 64 GB of RAM with H3
+    """
+
+    def __init__(self, model: torch.nn.Module, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)
+        self._originals = {}
+        for module_name, module in model.named_modules():
+            for name, t in list(module._parameters.items()) + list(module._buffers.items()):
+                if t is not None and t.device.type == "cpu":
+                    self._originals[(module_name, name)] = t
+
+    def _restore_originals(self):
+        modules = dict(self.model.named_modules())
+        for (module_name, name), t in self._originals.items():
+            module = modules.get(module_name, None)
+            if module is None:
+                continue
+            if name in module._parameters:
+                module._parameters[name] = t
+            elif name in module._buffers:
+                module._buffers[name] = t
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        if unpatch_weights and device_to is not None and torch.device(device_to).type == "cpu" and self._originals and not self.backup:
+            super().unpatch_model(device_to=None, unpatch_weights=True)
+            self._restore_originals()
+            self.current_device = torch.device("cpu")
+            return
+        return super().unpatch_model(device_to=device_to, unpatch_weights=unpatch_weights)
+
+    def clone(self):
+        n = super().clone()
+        n.__class__ = _FileBackedPatcher
+        n._originals = self._originals
+        return n
+
+
 _BASE_RESERVED_VRAM: int = None
 
 
@@ -386,6 +428,8 @@ def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
     try:
         # keep `inference_memory` free for activations; Forge streams the rest of the weights if they do not fit
         memory_management.load_models_gpu([patcher], memory_required=inference_memory)
+        # GGUF loading leaves the dequant / bake temporaries in the caching allocator (VRAM read as full -> WDDM paging)
+        torch.cuda.empty_cache()
     finally:
         memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM
 
@@ -445,14 +489,14 @@ class MiniMaxH3(ForgeDiffusionEngine):
         self.ref_latents = []
 
         load_device = memory_management.get_torch_device()
-        self.transformer = ModelPatcher(transformer, load_device=load_device, offload_device=memory_management.unet_offload_device())
+        self.transformer = _FileBackedPatcher(transformer, load_device=load_device, offload_device=memory_management.unet_offload_device())
         self.transformer_original = self.transformer
         self.lora_hash = str([])
         self.lora_hooks = []
         self.lora_adapters: list[_RuntimeLoRA] = []
-        self.text_encoder = ModelPatcher(text_encoder, load_device=memory_management.text_encoder_device(), offload_device=memory_management.text_encoder_offload_device())
-        self.vae = ModelPatcher(vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
-        self.audio_vae = None if audio_vae is None else ModelPatcher(audio_vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
+        self.text_encoder = _FileBackedPatcher(text_encoder, load_device=memory_management.text_encoder_device(), offload_device=memory_management.text_encoder_offload_device())
+        self.vae = _FileBackedPatcher(vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
+        self.audio_vae = None if audio_vae is None else _FileBackedPatcher(audio_vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
 
         from transformers import Qwen2TokenizerFast
 
