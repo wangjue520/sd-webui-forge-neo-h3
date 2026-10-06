@@ -722,17 +722,46 @@ class MiniMaxH3(ForgeDiffusionEngine):
         return self.tokenizer(text, add_special_tokens=False)["input_ids"] if text else []
 
     @torch.inference_mode()
-    def encode_prompt(self, prompt: str, pictures: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """pictures: [H, W, C] images shown to Qwen3-VL as <Picture i>"""
+    def encode_prompt(self, prompt: str, pictures: list[torch.Tensor], ref_items: list[dict] = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        pictures: [H, W, C] images shown to Qwen3-VL as <Picture i> (fl2va keyframes / reference images)
+        ref_items (ref2va with videos / audios, in request order): {"type": "image", "data"} / {"type": "audio"} /
+        {"type": "video", "data": [T, H, W, C] sampled at 2 fps, "timestamps"}
+        https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/text_encoders/minimax.py (MiniMaxH3Tokenizer)
+        """
         from backend.nn.minimax_h3.text_encoder import VISION_END, VISION_START
 
         te = self.text_encoder.model
         entries = []
-        if te.has_vision:
+
+        def vision(data, video_block=False):
+            if te.has_vision:
+                entries.extend([VISION_START, {"data": data.float(), "video_block": video_block}, VISION_END])
+
+        if ref_items:
+            counters = {"image": 0, "audio": 0, "video": 0}
+            for item in ref_items:
+                kind = item["type"]
+                counters[kind] += 1
+                if kind == "image":
+                    entries.extend(self._tokens(f"<Picture {counters['image']}>: "))
+                    vision(item["data"].unsqueeze(0))
+                elif kind == "audio":
+                    entries.extend(self._tokens(f"<Audio {counters['audio']}>: "))
+                else:
+                    frames, timestamps = item["data"], list(item["timestamps"])
+                    if frames.shape[0] % 2 == 1:  # repeat-pad to the temporal patch of 2
+                        frames = torch.cat([frames, frames[-1:]], dim=0)
+                        timestamps.append(timestamps[-1])
+                    entries.extend(self._tokens(f"<Video {counters['video']}>: "))
+                    for i in range(0, frames.shape[0], 2):
+                        entries.extend(self._tokens("<%.1f seconds>" % ((timestamps[i] + timestamps[i + 1]) / 2.0)))
+                        vision(frames[i : i + 2], video_block=True)
+        else:
             for i, img in enumerate(pictures):
-                entries += self._tokens(f"<Picture {i + 1}>: ")
-                entries += [VISION_START, {"data": img.unsqueeze(0).float(), "video_block": False}, VISION_END]
-        entries += self._tokens(prompt)
+                entries.extend(self._tokens(f"<Picture {i + 1}>: "))
+                vision(img.unsqueeze(0))
+        entries.extend(self._tokens(prompt))
 
         device = self.text_encoder.load_device
         # bf16, ~1 GB transient (more with reference images / videos for the vision tower)
@@ -743,6 +772,19 @@ class MiniMaxH3(ForgeDiffusionEngine):
             if not torch.isfinite(hidden).all():
                 raise RuntimeError("MiniMax-H3 text encoder produced NaN / Inf even in fp32 (corrupted text encoder file?)")
         return hidden.cpu(), tags
+
+    @torch.inference_mode()
+    def vae_encode_video(self, frames: torch.Tensor) -> torch.Tensor:
+        """[T, H, W, C] in [0, 1] (T = 17k + 5) -> normalized latent [1, 24, 5k + 2, H/16, W/16]"""
+        model = self.vae.model
+        x = frames.movedim(-1, 0).unsqueeze(0).mul(2.0).sub(1.0)  # [1, 3, T, H, W]; encode_temporal moves 17-frame clips itself
+        return run_on_gpu(self.vae, lambda: model.encode(x.to(dtype=model.dtype), device=self.vae.load_device).float().cpu(), inference_memory=4 * 2**30, stage="VAE encode (video)")
+
+    @torch.inference_mode()
+    def audio_encode(self, waveform: torch.Tensor) -> torch.Tensor:
+        """[2, L] at 32 kHz in [-1, 1] -> normalized latent [1, 32, 2, T] at 40 Hz"""
+        model = self.audio_vae.model
+        return run_on_gpu(self.audio_vae, lambda: model.encode(waveform.unsqueeze(0).to(device=self.audio_vae.load_device, dtype=torch.float32)).float().cpu(), inference_memory=1 * 2**30, stage="audio encode")
 
     @torch.inference_mode()
     def vae_encode(self, image: torch.Tensor) -> torch.Tensor:
@@ -792,15 +834,17 @@ class MiniMaxH3(ForgeDiffusionEngine):
         callback: Callable[[int, int], bool] = None,
         sampler: str = "Euler",
         preview: Callable = None,
+        ref_videos: list[dict] = None,
+        ref_audios: list[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
         """
         with vram_cap():
-            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview)
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios)
 
-    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None):
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -809,17 +853,46 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         keyframes, refs, pictures = [], [], []
 
-        if references:
+        ref_videos, ref_audios = ref_videos or [], ref_audios or []
+        if (ref_videos or ref_audios) and self.audio_vae is None:
+            logger.warning("[MiniMax-H3] reference audio needs the audio VAE; soundtracks / audio references are ignored")
+        ref_items = []
+        if references or ref_videos or ref_audios:
             if not self.is_ref2va:
-                logger.warning("Reference images are meant for the Ref2VA checkpoint")
-            logger.info(f"[MiniMax-H3] Reference-to-Video ({len(references)} reference(s))")
+                logger.warning("Reference images / videos / audios are meant for the Ref2VA checkpoint")
+            logger.info(f"[MiniMax-H3] Reference-to-Video ({len(references)} image(s), {len(ref_videos)} video(s), {len(ref_audios)} audio(s))")
             for img in references:
                 h, w = img.shape[0], img.shape[1]
                 scale = min(1.0, math.sqrt((width * height) / (w * h)))
                 tw, th = snap(w * scale), snap(h * scale)
                 resized = resize_image(img, tw, th, crop=False)
                 pictures.append(resized)
+                ref_items.append({"type": "image", "data": resized})
                 refs.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "ref_audio_t": 0, "latent": None, "_image": resized})
+            for video in ref_videos:
+                frames = video["frames"]
+                vh, vw = frames.shape[1], frames.shape[2]
+                # same pixel budget as the target canvas (ComfyUI uses a 768p canvas: too heavy next to H3 on 24 GB)
+                scale = min(1.0, math.sqrt((width * height) / (vw * vh)))
+                cw, ch = snap(vw * scale), snap(vh * scale)
+                frames = frames[:frame_count]
+                n = frames.shape[0]
+                if n < 5:
+                    raise ValueError("a reference video needs at least 5 frames")
+                while n % 17 != 5:
+                    n -= 1
+                frames = torch.stack([resize_image(f, cw, ch, crop=False) for f in frames[:n]])
+                soundtrack = video.get("audio") if self.audio_vae is not None else None
+                if soundtrack is not None:
+                    ref_items.append({"type": "audio"})
+                sample_idx = list(range(0, n, FPS // 2))  # 2 fps for Qwen
+                ref_items.append({"type": "video", "data": frames[sample_idx], "timestamps": [i / 2.0 for i in range(len(sample_idx))]})
+                refs.append({"kind": "video", "latent_h": ch // 16, "latent_w": cw // 16, "ref_audio_t": 0, "_video": frames, "_audio": soundtrack})
+            for waveform in ref_audios:
+                if self.audio_vae is None:
+                    continue
+                ref_items.append({"type": "audio"})
+                refs.append({"kind": "audio", "ref_audio_t": 0, "_audio": waveform})
             # keyframes on top of references (ComfyUI's MiniMaxH3AddGuide): latent-only guides, not shown to Qwen
             if first_frame is not None:
                 keyframes.append({"resolved_frame_index": 0, "_image": resize_image(first_frame, width, height, crop=True)})
@@ -840,17 +913,27 @@ class MiniMaxH3(ForgeDiffusionEngine):
         logger.info(f"[MiniMax-H3] {width}x{height} | {frame_count} frames ({frame_count / FPS:.2f}s) | {steps} steps | {sampler} | shift {self.shift}")
 
         timer = _StageTimer()
-        text_states, tags = self.encode_prompt(prompt, pictures)
+        text_states, tags = self.encode_prompt(prompt, pictures, ref_items=ref_items if (ref_videos or ref_audios) else None)
         timer("text encoder")
 
         for item in keyframes + refs:
-            item["latent"] = self.vae_encode(item.pop("_image"))
+            if "_image" in item:
+                item["latent"] = self.vae_encode(item.pop("_image"))
+            if "_video" in item:
+                item["latent"] = self.vae_encode_video(item.pop("_video"))
+                item["latent_t"] = item["latent"].shape[2]
+            if item.get("_audio") is not None:
+                item["audio_latent"] = self.audio_encode(item["_audio"])
+                item["ref_audio_t"] = item["audio_latent"].shape[-1]
+                if item["kind"] == "video":
+                    item["kind"] = "video_audio"
+            item.pop("_audio", None)
 
         payload = {
             "text_token_tags": tags,
             "seed": int(seed),
-            "cond_video_latents": [k["latent"] for k in keyframes] + [r["latent"] for r in refs],
-            "cond_audio_latents": [],
+            "cond_video_latents": [k["latent"] for k in keyframes] + [r["latent"] for r in refs if r.get("latent") is not None],
+            "cond_audio_latents": [k["audio_latent"] for k in keyframes if k.get("audio_latent") is not None] + [r["audio_latent"] for r in refs if r.get("audio_latent") is not None],
         }
         if keyframes:
             payload["keyframes"] = keyframes
@@ -862,7 +945,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         x_audio = torch.randn((1, 32, 2, audio_t), generator=generator, dtype=torch.float32)
 
         # activations of the packed sequence (hidden 5376, qkv 3x, mlp 2x14336) + a dequantized weight in flight
-        tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs)
+        tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs if r.get("latent") is not None) + sum(int(r.get("ref_audio_t", 0)) * 2 for r in refs)
         timer("vae encode")
         # measured ~1.2 MB of activations (incl. GGUF dequant temporaries) per packed token on a 3090
         inference_memory = tokens * 1.25 * 2**20 + 2 * 2**30

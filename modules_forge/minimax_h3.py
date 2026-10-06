@@ -19,8 +19,43 @@ ui_panels: list = []
 """components only visible for the h3 UI Preset (Reference tabs, Segments / Duration, MiniMax-H3 Video panels)"""
 
 
+reference_videos: dict[str, list[str]] = {"txt2img": [], "img2img": []}
+reference_audios: dict[str, list[str]] = {"txt2img": [], "img2img": []}
+
+
+def _paths(files: list | None) -> list[str]:
+    return [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in (files or [])]
+
+
 def set_reference_images(tabname: str, files: list | None):
-    reference_images[tabname] = [f if isinstance(f, str) else getattr(f, "name", str(f)) for f in (files or [])]
+    reference_images[tabname] = _paths(files)
+
+
+# region Media (ffmpeg)
+
+
+def load_video(path: str, fps: int = 24, max_frames: int = 15 * 24 + 5) -> torch.Tensor:
+    """video file -> [T, H, W, 3] float in [0, 1], resampled to `fps`"""
+    import json
+    import subprocess
+
+    info = json.loads(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", path], capture_output=True, text=True, check=True).stdout)
+    w, h = int(info["streams"][0]["width"]), int(info["streams"][0]["height"])
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-r", str(fps), "-frames:v", str(max_frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+    frames = np.frombuffer(raw, dtype=np.uint8)
+    frames = frames[: (frames.size // (w * h * 3)) * w * h * 3].reshape(-1, h, w, 3)
+    return torch.from_numpy(frames.astype(np.float32) / 255.0)
+
+
+def load_audio(path: str, sample_rate: int = 32000, max_seconds: float = 30.0) -> torch.Tensor | None:
+    """audio file (or a video's soundtrack) -> [2, L] float in [-1, 1] at `sample_rate`; None if there is no audio stream"""
+    import subprocess
+
+    out = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-t", str(max_seconds), "-ac", "2", "-ar", str(sample_rate), "-f", "f32le", "-"], capture_output=True)
+    if out.returncode != 0 or len(out.stdout) < 8 * 800:
+        return None
+    pcm = np.frombuffer(out.stdout, dtype=np.float32)
+    return torch.from_numpy(pcm[: pcm.size // 2 * 2].reshape(-1, 2).T.copy())
 
 
 def create_reference_tab(tabname: str):
@@ -39,6 +74,20 @@ def create_reference_tab(tabname: str):
             return reference_images[tabname]
 
         files.change(on_change, inputs=[files], outputs=[gallery], queue=False, show_progress=False)
+
+        gr.Markdown("参考视频（自带声音会一起参考）与参考音频：提示词中用 Video 1、Audio 1… 指代；参考视频会按目标画面大小缩放，并截到与生成时长相同。")
+        with gr.Row():
+            videos = gr.File(label="Reference Videos (≤3)", file_count="multiple", file_types=["video"], type="filepath", elem_id=f"{tabname}_h3_reference_videos")
+            audios = gr.File(label="Reference Audios (≤3)", file_count="multiple", file_types=["audio"], type="filepath", elem_id=f"{tabname}_h3_reference_audios")
+
+        def on_videos(f):
+            reference_videos[tabname] = _paths(f)[:3]
+
+        def on_audios(f):
+            reference_audios[tabname] = _paths(f)[:3]
+
+        videos.change(on_videos, inputs=[videos], queue=False, show_progress=False)
+        audios.change(on_audios, inputs=[audios], queue=False, show_progress=False)
     ui_panels.append(tab)
 
 
@@ -218,6 +267,23 @@ def process_images(p) -> "Processed":
     if references:
         p.extra_generation_params["Reference Images"] = len(references)
 
+    tab = "img2img" if isinstance(p, StableDiffusionProcessingImg2Img) else "txt2img"
+    ref_videos, ref_audios = [], []
+    for path in reference_videos[tab]:
+        try:
+            ref_videos.append({"frames": load_video(path), "audio": load_audio(path, AUDIO_SAMPLE_RATE)})
+        except Exception as e:
+            print(f"[MiniMax-H3] failed to read reference video {path}: {e}")
+    for path in reference_audios[tab]:
+        if (waveform := load_audio(path, AUDIO_SAMPLE_RATE)) is not None:
+            ref_audios.append(waveform)
+        else:
+            print(f"[MiniMax-H3] failed to read reference audio {path}")
+    if ref_videos:
+        p.extra_generation_params["Reference Videos"] = len(ref_videos)
+    if ref_audios:
+        p.extra_generation_params["Reference Audios"] = len(ref_audios)
+
     # region Segments
     # keyframes given: segment i goes from keyframe i (or the previous segment's last frame) to keyframe i + 1
     # otherwise: each segment continues from the previous segment's last frame
@@ -289,6 +355,8 @@ def process_images(p) -> "Processed":
                 callback=callback,
                 sampler=p.sampler_name,
                 preview=_preview if opts.live_previews_enable else None,
+                ref_videos=ref_videos,
+                ref_audios=ref_audios,
             )
 
             # the first frame of a continuation repeats the previous segment's last frame
