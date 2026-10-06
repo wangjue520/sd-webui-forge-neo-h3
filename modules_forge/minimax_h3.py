@@ -287,6 +287,16 @@ def process_images(p) -> "Processed":
             print(f"[MiniMax-H3] failed to read frame guide {path}: {e}")
     if guides:
         p.extra_generation_params["Frame Guides"] = ", ".join(f"{s}s" for _, s in options["guides"])
+    control = None
+    if (c := options.get("control")) and c.get("model"):
+        control = {"model": c["model"], "strength": c["strength"], "start": c["start"], "end": c["end"], "video": None, "mask": None, "source": None}
+        if c.get("video"):
+            control["video"] = load_video(c["video"])
+        if c.get("mask"):
+            control["mask"] = load_video(c["mask"]).mean(dim=-1)  # white = regenerate
+            if c.get("source"):
+                control["source"] = load_video(c["source"])
+        p.extra_generation_params["Fun ControlNet"] = f'{os.path.basename(c["model"])} x{c["strength"]} ({c["start"]:.2f}-{c["end"]:.2f})'
     if ref_videos:
         p.extra_generation_params["Reference Videos"] = len(ref_videos)
     if ref_audios:
@@ -366,6 +376,7 @@ def process_images(p) -> "Processed":
                 ref_videos=ref_videos,
                 ref_audios=ref_audios,
                 guides=guides if i == 0 else None,  # guide times refer to the first segment
+                control=control if num_segments == 1 else None,
             )
 
             # the first frame of a continuation repeats the previous segment's last frame

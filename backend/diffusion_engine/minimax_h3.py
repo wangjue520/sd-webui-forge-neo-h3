@@ -325,6 +325,75 @@ def load_audio_vae(path: str):
     return model
 
 
+def load_controlnet(path: str):
+    """MiniMax-H3 Fun ControlNet-Union (ComfyUI model_patches/minimax_h3_fun_controlnet_union_*.safetensors)"""
+    from backend.nn.minimax_h3._compat import ops
+    from backend.nn.minimax_h3.controlnet import MiniMaxH3FunControl, is_fun_control
+
+    sd, metadata = _load_sd(path)
+    if not is_fun_control(sd.keys()):
+        raise ValueError(f'"{os.path.basename(path)}" is not a MiniMax-H3 Fun ControlNet')
+    num_blocks = 0
+    while f"control_blocks.{num_blocks}.after_proj.weight" in sd:
+        num_blocks += 1
+    # https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_model_patch.py
+    injection_layers = tuple(json.loads(metadata["control_blocks_places"])) if "control_blocks_places" in metadata else tuple(range(0, 50, 50 // num_blocks))
+    head_dim = sd["control_blocks.0.attn.q_norm.weight"].shape[0]
+    use_adaln_curves = metadata.get("minimax_h3_fun_controlnet") == "adaln_basis"
+    config = dict(
+        control_in_dim=49,
+        injection_layers=injection_layers,
+        inpaint_post_norm=metadata.get("inpaint_masked_pixel_mode") == "post_norm",
+        hidden_size=sd["control_proj_in.weight"].shape[0],
+        num_attention_heads=sd["control_blocks.0.attn.qkv_proj.weight"].shape[0] // (3 * head_dim),
+        attention_head_dim=head_dim,
+        ffn_hidden_size=sd["control_blocks.0.mlp.fc1.weight"].shape[0] // 2,
+        time_embed_dim=8 if use_adaln_curves else 2688,
+        use_adaln_curves=use_adaln_curves,
+    )
+    logger.info(f"[ControlNet] {os.path.basename(path)}: {config}")
+    load_device = memory_management.get_torch_device()
+    storage_dtype, quant_config = _storage(sd, torch.bfloat16, is_unet=True)
+    compute_dtype = torch.bfloat16 if memory_management.should_use_bf16(load_device) else torch.float32
+    model = _build(lambda: MiniMaxH3FunControl(**config, operations=ops), sd, storage_dtype, quant_config, compute_dtype, memory_management.cpu, "ControlNet")
+    return _FileBackedPatcher(model, load_device=load_device, offload_device=memory_management.unet_offload_device())
+
+
+class _FunControlPatch:
+    """runs the control stream next to the base DiT blocks (ComfyUI MiniMaxH3FunControlPatch)"""
+
+    def __init__(self, model, control_latent: torch.Tensor, strength: float):
+        self.model, self.latent, self.strength = model, control_latent, strength
+        self.active = True
+        self.stream = self.pristine = None
+
+    def install(self, transformer_options: dict):
+        dit = transformer_options.setdefault("patches_replace", {}).setdefault("dit", {})
+        for index in self.model.injection_layers:
+            dit[("double_block", index)] = self._block_patch(index)
+
+    def _block_patch(self, block_index: int):
+        layers = self.model.injection_layers
+
+        def patch(args, extra):
+            if self.active and block_index == layers[0]:
+                self.pristine = args["img"].clone()
+            out = extra["original_block"](args)
+            if not self.active:
+                return out
+            index = layers.index(block_index)
+            if index == 0:
+                self.latent = self.latent.to(out["img"].device)
+                self.stream = self.model.init_stream(self.pristine, self.latent, args["layout"], args["t_emb"])
+                self.pristine = None
+            self.stream, skip = self.model.step(index, self.stream, args["t_emb"], args["mod_segments"], args["rope_freqs"], transformer_options=args["transformer_options"])
+            skip[args["layout"].audio_pos.to(skip.device)] = 0
+            out["img"].add_(skip, alpha=self.strength)
+            return out
+
+        return patch
+
+
 def load_minimax_h3(path: str, additional_state_dicts: list[str] = None) -> "MiniMaxH3":
     modules = {"text_encoder": [], "vision": [], "vae": [], "audio_vae": []}
     for p in additional_state_dicts or []:
@@ -438,13 +507,15 @@ class vram_cap:
             torch.cuda.set_per_process_memory_fraction(1.0, self.device)
 
 
-def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
+def load_gpu(patcher: ModelPatcher | list[ModelPatcher], inference_memory: float = 0):
     """load_model_gpu, reserving the VRAM other processes use so that Forge offloads (streams) instead of
     oversubscribing into Windows' shared GPU memory, which makes the 17 GB text encoder and the DiT 10-100x slower"""
     global _BASE_RESERVED_VRAM
     # H3 runs its huge components one after another (TE 17 GB -> DiT 11 GB -> VAE 5 GB); Forge's policy partially
     # loads the next one instead of evicting the previous, which ends up oversubscribing VRAM; so evict explicitly
-    if not any(m.model is patcher for m in memory_management.current_loaded_models):
+    patchers = patcher if isinstance(patcher, list) else [patcher]
+    patcher = patchers[0]
+    if not all(any(m.model is p for m in memory_management.current_loaded_models) for p in patchers):
         memory_management.unload_all_models()
         memory_management.soft_empty_cache()
     if _BASE_RESERVED_VRAM is None:
@@ -455,7 +526,7 @@ def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
         logger.info(f"{external / 2**30:.1f} GiB VRAM is used by other processes; reserving it")
     try:
         # keep `inference_memory` free for activations; Forge streams the rest of the weights if they do not fit
-        memory_management.load_models_gpu([patcher], memory_required=inference_memory)
+        memory_management.load_models_gpu(patchers, memory_required=inference_memory)
         # GGUF loading leaves the dequant / bake temporaries in the caching allocator (VRAM read as full -> WDDM paging)
         torch.cuda.empty_cache()
     finally:
@@ -607,6 +678,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         self.transformer_original = self.transformer
         self.lora_hash = str([])
         self.lora_hooks = []
+        self.controlnet = None  # (path, patcher), loaded on demand
         self.lora_adapters: list[_RuntimeLoRA] = []
         self.text_encoder = _FileBackedPatcher(text_encoder, load_device=memory_management.text_encoder_device(), offload_device=memory_management.text_encoder_offload_device())
         self.vae = _FileBackedPatcher(vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
@@ -773,6 +845,49 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 raise RuntimeError("MiniMax-H3 text encoder produced NaN / Inf even in fp32 (corrupted text encoder file?)")
         return hidden.cpu(), tags
 
+    def _prepare_control(self, control: dict, frame_count: int, latent_t: int, width: int, height: int):
+        """
+        control: {"model": path, "video": [T, H, W, C] or None, "mask": [T, H, W] (1 = regenerate) or None, "source": [T, H, W, C] or None,
+        "strength", "start", "end"} -> _FunControlPatch with the 24 (control) or 49 (control | visibility | masked source) channel latent
+        https://github.com/Comfy-Org/ComfyUI/blob/master/comfy_extras/nodes_minimax_h3.py (prepare_control_latent)
+        """
+        if self.controlnet is None or self.controlnet[0] != control["model"]:
+            self.controlnet = (control["model"], load_controlnet(control["model"]))
+        patcher = self.controlnet[1]
+
+        def fit(frames):
+            idx = torch.arange(frame_count).clamp(max=frames.shape[0] - 1)
+            return torch.stack([resize_image(f, width, height, crop=True) for f in frames[idx]])
+
+        hint = None
+        if control.get("video") is not None:
+            hint = self.vae_encode_video(fit(control["video"]))
+        if control.get("mask") is not None:
+            mask = control["mask"].float()
+            idx = torch.arange(frame_count).clamp(max=mask.shape[0] - 1)
+            mask = F.interpolate(mask[idx].unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False)[:, 0]
+            visibility = 1.0 - (mask > 0.5).float()  # [T, H, W]
+            source = fit(control["source"]) if control.get("source") is not None else torch.zeros(frame_count, height, width, 3)
+            masked = source * visibility.unsqueeze(-1)
+            if patcher.model.inpaint_post_norm:
+                from backend.nn.minimax_h3.vae import IMAGENET_MEAN
+
+                masked = masked + (1.0 - visibility.unsqueeze(-1)) * torch.tensor(IMAGENET_MEAN).view(1, 1, 1, 3)
+            masked_latent = self.vae_encode_video(masked)
+            if hint is None:
+                hint = torch.zeros_like(masked_latent)
+            vis_latent = F.interpolate(visibility[None, None], size=tuple(masked_latent.shape[2:]), mode="trilinear", align_corners=False)
+            hint = torch.cat([hint, vis_latent, masked_latent], dim=1)
+        if hint is None:
+            return None
+        if hint.shape[2] != latent_t:
+            raise ValueError(f"control latent has {hint.shape[2]} frames, expected {latent_t}")
+        mode = "+".join(k for k in ("video", "mask") if control.get(k) is not None)
+        logger.info(f"[MiniMax-H3] Fun ControlNet ({mode}) strength {control['strength']} steps {control['start']:.0%}-{control['end']:.0%}")
+        fc = _FunControlPatch(patcher.model, hint, float(control["strength"]))
+        fc.patcher = patcher
+        return fc
+
     @torch.inference_mode()
     def vae_encode_video(self, frames: torch.Tensor) -> torch.Tensor:
         """[T, H, W, C] in [0, 1] (T = 17k + 5) -> normalized latent [1, 24, 5k + 2, H/16, W/16]"""
@@ -837,15 +952,16 @@ class MiniMaxH3(ForgeDiffusionEngine):
         ref_videos: list[dict] = None,
         ref_audios: list[torch.Tensor] = None,
         guides: list[tuple[int, torch.Tensor]] = None,
+        control: dict = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
         """
         with vram_cap():
-            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios, guides)
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios, guides, control)
 
-    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None, guides=None):
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None, guides=None, control=None):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -938,6 +1054,10 @@ class MiniMaxH3(ForgeDiffusionEngine):
                     item["kind"] = "video_audio"
             item.pop("_audio", None)
 
+        fun_control = self._prepare_control(control, frame_count, latent_t, width, height) if control else None
+        if fun_control is not None:
+            timer("control encode")
+
         payload = {
             "text_token_tags": tags,
             "seed": int(seed),
@@ -958,7 +1078,10 @@ class MiniMaxH3(ForgeDiffusionEngine):
         timer("vae encode")
         # measured ~1.2 MB of activations (incl. GGUF dequant temporaries) per packed token on a 3090
         inference_memory = tokens * 1.25 * 2**20 + 2 * 2**30
-        load_gpu(self.transformer, inference_memory=inference_memory)
+        dit_patchers = [self.transformer] + ([fun_control.patcher] if fun_control is not None else [])
+        if fun_control is not None:
+            inference_memory += 1 * 2**30  # control stream
+        load_gpu(dit_patchers, inference_memory=inference_memory)
         timer("load transformer")
         device = self.transformer.load_device
         dit = self.transformer.model
@@ -972,6 +1095,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
         sigmas_v = time_shift(base, shift_v)
         sigmas_a = time_shift(base, shift_a)
         transformer_options = {"sample_sigmas": sigmas_v, "minimax_h3_sigma_shift_video": shift_v, "minimax_h3_sigma_shift_audio": shift_a}
+        if fun_control is not None:
+            fun_control.install(transformer_options)
 
         video_sampler, audio_sampler = FlowSampler(sampler, sigmas_v), FlowSampler(sampler, sigmas_a)
         if sampler not in FlowSampler.NAMES:
@@ -982,6 +1107,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
             sv, sv_next = sigmas_v[i], sigmas_v[i + 1]
             sa, sa_next = sigmas_a[i], sigmas_a[i + 1]
             timestep = (sv * 1000.0).view(1).to(device)
+            if fun_control is not None:
+                fun_control.active = control["start"] <= i / int(steps) < control["end"]
             for attempt in range(3):
                 try:
                     out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload)
@@ -996,7 +1123,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
                         adapter.cache = None
                     memory_management.unload_all_models()
                     torch.cuda.empty_cache()
-                    load_gpu(self.transformer, inference_memory=inference_memory)
+                    load_gpu(dit_patchers, inference_memory=inference_memory)
             # Euler on the rectified flow: x0 = x - sigma * v
             if not (torch.isfinite(out_v).all() and torch.isfinite(out_a).all()):
                 raise RuntimeError(f"MiniMax-H3 produced NaN / Inf at step {i + 1} (try fewer / more steps, another shift, or a less aggressive quantization)")

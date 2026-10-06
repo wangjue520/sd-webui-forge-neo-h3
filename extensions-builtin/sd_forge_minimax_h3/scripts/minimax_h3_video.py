@@ -40,6 +40,32 @@ def find_lora(name: str) -> str | None:
     return None
 
 
+def _controlnet_dirs() -> list[str]:
+    dirs = [os.path.join(os.path.dirname(shared.cmd_opts.lora_dir or ""), "model_patches"), os.path.join("models", "ControlNet")]
+    dirs += list(getattr(shared.cmd_opts, "controlnet_dirs", None) or [])
+    for d in list(getattr(shared.cmd_opts, "lora_dirs", None) or []) + list(getattr(shared.cmd_opts, "text_encoder_dirs", None) or []):
+        dirs.append(os.path.join(os.path.dirname(os.path.normpath(d)), "model_patches"))
+    return [d for d in dict.fromkeys(dirs) if d and os.path.isdir(d)]
+
+
+def list_controlnets() -> list[str]:
+    found = {}
+    for d in _controlnet_dirs():
+        for f in shared.walk_files(d, allowed_extensions=[".safetensors", ".gguf"]):
+            name = os.path.basename(f).lower()
+            if "h3" in name and "control" in name:
+                found[os.path.basename(f)] = f
+    return ["None"] + sorted(found)
+
+
+def find_controlnet(name: str) -> str | None:
+    for d in _controlnet_dirs():
+        for f in shared.walk_files(d, allowed_extensions=[".safetensors", ".gguf"]):
+            if os.path.basename(f) == name:
+                return f
+    return None
+
+
 def list_upscalers() -> list[str]:
     return ["None"] + [x.name for x in shared.sd_upscalers if x.name != "None"]
 
@@ -88,6 +114,21 @@ class MiniMaxH3Video(scripts.Script):
                 guide_files = gr.File(label="Guide Images", file_count="multiple", file_types=["image"], type="filepath", height=96)
                 guide_times = gr.Textbox(label="Times (seconds)", placeholder="例如: 1.0, 2.5, -0.5", lines=1)
 
+            with gr.Tab("ControlNet 控制"):
+                gr.Markdown("Fun ControlNet-Union：上传已处理好的控制视频（姿态骨架 / 深度 / 线稿等），或用遮罩做视频局部重绘（遮罩白色 = 重新生成，源视频提供其余部分）。模型放在 MOD\\model_patches。")
+                with gr.Row():
+                    cn_model = gr.Dropdown(label="ControlNet Model", choices=list_controlnets(), value="None")
+                    cn_refresh = gr.Button("🔄", scale=0, min_width=40)
+                with gr.Row():
+                    cn_video = gr.File(label="Control Video (pose / depth / canny ...)", file_types=["video"], type="filepath", height=96)
+                    cn_mask = gr.File(label="Inpaint Mask (video or image)", file_types=["video", "image"], type="filepath", height=96)
+                    cn_source = gr.File(label="Source Video (for inpaint)", file_types=["video"], type="filepath", height=96)
+                with gr.Row():
+                    cn_strength = gr.Slider(label="Strength", minimum=0.0, maximum=2.0, step=0.05, value=1.0)
+                    cn_start = gr.Slider(label="Start", minimum=0.0, maximum=1.0, step=0.05, value=0.0)
+                    cn_end = gr.Slider(label="End", minimum=0.0, maximum=1.0, step=0.05, value=1.0)
+                cn_refresh.click(lambda: gr.update(choices=list_controlnets()), outputs=[cn_model], queue=False, show_progress=False)
+
             with gr.Tab("Turbo 加速"):
                 gr.Markdown("lightx2v Turbo LoRA（请使用 *_comfyui_* 格式文件，放在 models/Lora）。推荐 8 步 / Shift 6。")
                 with gr.Row():
@@ -106,9 +147,11 @@ class MiniMaxH3Video(scripts.Script):
                     upscale_by = gr.Slider(label="Scale", minimum=1.0, maximum=4.0, step=0.25, value=2.0)
 
         minimax_h3.ui_panels.append(panel)
-        return [keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files, guide_times]
+        return [keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files, guide_times, cn_model, cn_video, cn_mask, cn_source, cn_strength, cn_start, cn_end]
 
-    def before_process(self, p, keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files=None, guide_times="", *args, **kwargs):
+    def before_process(self, p, keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files=None, guide_times="", cn_model="None", cn_video=None, cn_mask=None, cn_source=None, cn_strength=1.0, cn_start=0.0, cn_end=1.0, *args, **kwargs):
+        if cn_model not in (None, "None") and (cn_video or cn_mask):
+            _options(p)["control"] = {"model": find_controlnet(cn_model), "video": cn_video, "mask": cn_mask, "source": cn_source, "strength": float(cn_strength), "start": float(cn_start), "end": float(cn_end)}
         files = sorted(guide_files or [])
         times = [t.strip() for t in (guide_times or "").replace("，", ",").split(",") if t.strip()]
         if files and len(times) != len(files):
