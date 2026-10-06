@@ -147,7 +147,7 @@ def _materialize(sd: dict):
     available = psutil.virtual_memory().available
     if size == 0:
         return
-    if available - size < 20 * 2**30:  # leave room for the other H3 components and the rest of the system
+    if available - size < 40 * 2**30:  # measured: the cached TE alone costs ~25 GB RSS on GPU loads; only worth it with plenty of RAM
         logger.warning(f"not enough free RAM to cache {size / 2**30:.1f} GB of GGUF weights ({available / 2**30:.1f} GB free); reloads will read the disk")
         return
     for v in tensors:
