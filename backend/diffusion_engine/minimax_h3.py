@@ -128,8 +128,20 @@ def classify_module(path: str) -> str | None:
 
 def _load_sd(path: str) -> tuple[dict, dict]:
     sd, metadata = utils.load_torch_file(path, return_metadata=True)
+    _materialize(sd)
     sd, metadata = convert_quantization(sd, metadata)
     return sd, metadata or {}
+
+
+def _materialize(sd: dict):
+    """
+    copy memory-mapped weights into process RAM: H3's files total >30 GB, so Windows evicts their file-cache pages
+    between generations and every reload of the text encoder / DiT re-reads the disk at ~1 GB/s (20+ s per generation)
+    instead of copying RAM -> VRAM at ~9 GB/s
+    """
+    for k, v in sd.items():
+        if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+            v.data = v.data.clone()
 
 
 def _storage(sd: dict, default: torch.dtype, is_unet: bool = False):
@@ -368,6 +380,25 @@ def load_gpu(patcher: ModelPatcher, inference_memory: float = 0):
         memory_management.EXTRA_RESERVED_VRAM = _BASE_RESERVED_VRAM
 
 
+class _StageTimer:
+    def __init__(self):
+        import time
+
+        self.time = time.perf_counter
+        self.last = self.start = self.time()
+        self.stages = []
+
+    def __call__(self, name: str):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        now = self.time()
+        self.stages.append((name, now - self.last))
+        self.last = now
+
+    def summary(self) -> str:
+        return " | ".join(f"{n} {t:.1f}s" for n, t in self.stages if t >= 0.05) + f" | total {self.last - self.start:.1f}s"
+
+
 # region Engine
 
 
@@ -408,6 +439,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         self.transformer_original = self.transformer
         self.lora_hash = str([])
         self.lora_hooks = []
+        self.lora_adapters: list[_RuntimeLoRA] = []
         self.text_encoder = ModelPatcher(text_encoder, load_device=memory_management.text_encoder_device(), offload_device=memory_management.text_encoder_offload_device())
         self.vae = ModelPatcher(vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
         self.audio_vae = None if audio_vae is None else ModelPatcher(audio_vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
@@ -457,6 +489,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         for handle in self.lora_hooks:
             handle.remove()
         self.lora_hooks.clear()
+        self.lora_adapters.clear()
 
         for path, strength in loras:
             lora_sd = utils.load_torch_file(path)
@@ -497,7 +530,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
             module = dit.get_submodule(target[: -len(".weight")])
             rank = A.shape[0]
             scale = strength * ((float(alpha) / rank) if alpha is not None else 1.0)
-            self.lora_hooks.append(module.register_forward_hook(_RuntimeLoRA(A, B, scale)))
+            adapter = _RuntimeLoRA(A, B, scale)
+            self.lora_adapters.append(adapter)
+            self.lora_hooks.append(module.register_forward_hook(adapter))
             matched += 1
 
         if matched == 0:
@@ -531,7 +566,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
                 entries += [VISION_START, {"data": img.unsqueeze(0).float(), "video_block": False}, VISION_END]
         entries += self._tokens(prompt)
 
-        load_gpu(self.text_encoder, inference_memory=4 * 2**30)
+        load_gpu(self.text_encoder, inference_memory=1.5 * 2**30)  # bf16, ~1 GB transient: fits 24 GB entirely
         device = self.text_encoder.load_device
         hidden, tags = te.encode(entries, device)
         return hidden.cpu(), tags
@@ -619,7 +654,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         logger.info(f"[MiniMax-H3] {width}x{height} | {frame_count} frames ({frame_count / FPS:.2f}s) | {steps} steps | shift {self.shift}")
 
+        timer = _StageTimer()
         text_states, tags = self.encode_prompt(prompt, pictures)
+        timer("text encoder")
 
         for item in keyframes + refs:
             item["latent"] = self.vae_encode(item.pop("_image"))
@@ -641,7 +678,9 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         # activations of the packed sequence (hidden 5376, qkv 3x, mlp 2x14336) + a dequantized weight in flight
         tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs)
+        timer("vae encode")
         load_gpu(self.transformer, inference_memory=tokens * (5376 * 2 * 8 + 28672 * 2 * 2) + 2**30)
+        timer("load transformer")
         device = self.transformer.load_device
         dit = self.transformer.model
         dtype = dit.computation_dtype
@@ -670,6 +709,12 @@ class MiniMaxH3(ForgeDiffusionEngine):
             callback(int(steps), int(steps))
 
         del context
+        timer(f"{int(steps)} steps")
+        for adapter in self.lora_adapters:
+            adapter.cache = None  # the 1.8 GB Turbo LoRA must not stay in VRAM next to the text encoder / VAE
         frames = self.vae_decode(x_video)[:frame_count]
+        timer("vae decode")
         audio = self.audio_decode(x_audio)
+        timer("audio decode")
+        logger.info(f"[MiniMax-H3] {timer.summary()}")
         return frames, (audio[0] if audio is not None else None)

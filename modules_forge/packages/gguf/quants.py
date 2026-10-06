@@ -19,6 +19,19 @@ from .quick_4bits_ops import (
 quick_split = lambda x, p: torch.split(x, p + [x.shape[1] - sum(p)], dim=-1)
 
 
+
+_CONST_CACHE: dict = {}
+
+
+def _const(values: list, device, dtype):
+    """small constant tensors cached per device: building them per call is a synchronizing host->device copy
+    (each one waits for all queued GPU work; ~80 ms per layer under Windows WDDM)"""
+    key = (tuple(values), str(device), dtype)
+    t = _CONST_CACHE.get(key, None)
+    if t is None:
+        t = _CONST_CACHE[key] = torch.tensor(values, device=device, dtype=dtype)
+    return t
+
 def quant_shape_to_byte_shape(
     shape: Sequence[int], quant_type: GGMLQuantizationType
 ) -> tuple[int, ...]:
@@ -398,7 +411,7 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         max_vals = torch.gather(blocks, -1, imax)
 
         d = max_vals / -8
-        id = torch.where(d == 0, torch.tensor(0.0, device=d.device), 1.0 / d)
+        id = torch.where(d == 0, 0.0, 1.0 / d)
 
         qs = torch.trunc((blocks * id) + 8.5).clip(0, 15).to(torch.uint8)
 
@@ -549,9 +562,7 @@ class Q5_0(__Quant, qtype=GGMLQuantizationType.Q5_0):
         qh = qh.reshape(n_blocks, 1) >> torch.arange(
             32, device=d.device, dtype=torch.int32
         ).reshape(1, 32)
-        ql = qs.reshape(n_blocks, -1, 1, block_size // 2) >> torch.tensor(
-            [0, 4], device=d.device, dtype=torch.uint8
-        ).reshape(1, 1, 2, 1)
+        ql = qs.reshape(n_blocks, -1, 1, block_size // 2) >> _const([0, 4], d.device, torch.uint8).reshape(1, 1, 2, 1)
 
         qh = (qh & 1).to(torch.uint8)
         ql = (ql & 0x0F).reshape(n_blocks, -1)
@@ -571,7 +582,7 @@ class Q5_0(__Quant, qtype=GGMLQuantizationType.Q5_0):
         max_val = torch.gather(blocks, dim=-1, index=imax)
 
         d = max_val / -16
-        id = torch.where(d == 0, torch.tensor(0.0, device=d.device), 1.0 / d)
+        id = torch.where(d == 0, 0.0, 1.0 / d)
 
         q = (
             torch.trunc((blocks.float() * id.float()) + 16.5)
@@ -675,9 +686,7 @@ class Q5_1(__Quant, qtype=GGMLQuantizationType.Q5_1):
         qh = qh.reshape((n_blocks, 1)) >> torch.arange(
             32, device=d.device, dtype=torch.int32
         ).reshape(1, 32)
-        ql = qs.reshape((n_blocks, -1, 1, block_size // 2)) >> torch.tensor(
-            [0, 4], device=d.device, dtype=torch.uint8
-        ).reshape(1, 1, 2, 1)
+        ql = qs.reshape((n_blocks, -1, 1, block_size // 2)) >> _const([0, 4], d.device, torch.uint8).reshape(1, 1, 2, 1)
         qh = (qh & 1).to(torch.uint8)
         ql = (ql & 0x0F).reshape((n_blocks, -1))
 
@@ -780,7 +789,7 @@ class Q2_K(__Quant, qtype=GGMLQuantizationType.Q2_K):
         # (n_blocks, 16, 1)
         dl = (d * (scales & 0xF)).reshape((n_blocks, QK_K // 16, 1))
         ml = (dmin * (scales >> 4)).reshape((n_blocks, QK_K // 16, 1))
-        shift = torch.tensor([0, 2, 4, 6], device=d.device, dtype=torch.uint8).reshape(
+        shift = _const([0, 2, 4, 6], d.device, torch.uint8).reshape(
             (1, 1, 4, 1)
         )
         qs = (qs.reshape((n_blocks, -1, 1, 32)) >> shift) & 3
@@ -853,23 +862,15 @@ class Q3_K(__Quant, qtype=GGMLQuantizationType.Q3_K):
         hmask, qs, scales, d = quick_split(blocks, [QK_K // 8, QK_K // 4, 12])
         d = d.view(torch.float16).to(parameter.computation_dtype)
         lscales, hscales = scales[:, :8], scales[:, 8:]
-        lscales = lscales.reshape((n_blocks, 1, 8)) >> torch.tensor(
-            [0, 4], device=d.device, dtype=torch.uint8
-        ).reshape((1, 2, 1))
+        lscales = lscales.reshape((n_blocks, 1, 8)) >> _const([0, 4], d.device, torch.uint8).reshape((1, 2, 1))
         lscales = lscales.reshape((n_blocks, 16))
-        hscales = hscales.reshape((n_blocks, 1, 4)) >> torch.tensor(
-            [0, 2, 4, 6], device=d.device, dtype=torch.uint8
-        ).reshape((1, 4, 1))
+        hscales = hscales.reshape((n_blocks, 1, 4)) >> _const([0, 2, 4, 6], d.device, torch.uint8).reshape((1, 4, 1))
         hscales = hscales.reshape((n_blocks, 16))
         scales = (lscales & 0x0F) | ((hscales & 0x03) << 4)
         scales = scales.to(torch.int8) - 32
         dl = (d * scales).reshape((n_blocks, 16, 1))
-        ql = qs.reshape((n_blocks, -1, 1, 32)) >> torch.tensor(
-            [0, 2, 4, 6], device=d.device, dtype=torch.uint8
-        ).reshape((1, 1, 4, 1))
-        qh = hmask.reshape(n_blocks, -1, 1, 32) >> torch.tensor(
-            [i for i in range(8)], device=d.device, dtype=torch.uint8
-        ).reshape((1, 1, 8, 1))
+        ql = qs.reshape((n_blocks, -1, 1, 32)) >> _const([0, 2, 4, 6], d.device, torch.uint8).reshape((1, 1, 4, 1))
+        qh = hmask.reshape(n_blocks, -1, 1, 32) >> _const([i for i in range(8)], d.device, torch.uint8).reshape((1, 1, 8, 1))
         ql = ql.reshape((n_blocks, 16, QK_K // 16)) & 3
         qh = (qh.reshape((n_blocks, 16, QK_K // 16)) & 1) ^ 1
         q = ql.to(torch.int8) - (qh << 2).to(torch.int8)
@@ -1020,12 +1021,8 @@ class Q5_K(__Quant, qtype=GGMLQuantizationType.Q5_K):
         sc, m = Q4_K.get_scale_min_pytorch(scales)
         d = (d * sc).reshape((n_blocks, -1, 1))
         dm = (dmin * m).reshape((n_blocks, -1, 1))
-        ql = qs.reshape((n_blocks, -1, 1, 32)) >> torch.tensor(
-            [0, 4], device=d.device, dtype=torch.uint8
-        ).reshape((1, 1, 2, 1))
-        qh = qh.reshape((n_blocks, -1, 1, 32)) >> torch.tensor(
-            [i for i in range(8)], device=d.device, dtype=torch.uint8
-        ).reshape((1, 1, 8, 1))
+        ql = qs.reshape((n_blocks, -1, 1, 32)) >> _const([0, 4], d.device, torch.uint8).reshape((1, 1, 2, 1))
+        qh = qh.reshape((n_blocks, -1, 1, 32)) >> _const([i for i in range(8)], d.device, torch.uint8).reshape((1, 1, 8, 1))
         ql = (ql & 0x0F).reshape((n_blocks, -1, 32))
         qh = (qh & 0x01).reshape((n_blocks, -1, 32))
         q = ql | (qh << 4)
@@ -1073,13 +1070,9 @@ class Q6_K(__Quant, qtype=GGMLQuantizationType.Q6_K):
         scales = scales.view(torch.int8).to(parameter.computation_dtype)
         d = d.view(torch.float16).to(parameter.computation_dtype)
         d = (d * scales).reshape((n_blocks, QK_K // 16, 1))
-        ql = ql.reshape((n_blocks, -1, 1, 64)) >> torch.tensor(
-            [0, 4], device=d.device, dtype=torch.uint8
-        ).reshape((1, 1, 2, 1))
+        ql = ql.reshape((n_blocks, -1, 1, 64)) >> _const([0, 4], d.device, torch.uint8).reshape((1, 1, 2, 1))
         ql = (ql & 0x0F).reshape((n_blocks, -1, 32))
-        qh = qh.reshape((n_blocks, -1, 1, 32)) >> torch.tensor(
-            [0, 2, 4, 6], device=d.device, dtype=torch.uint8
-        ).reshape((1, 1, 4, 1))
+        qh = qh.reshape((n_blocks, -1, 1, 32)) >> _const([0, 2, 4, 6], d.device, torch.uint8).reshape((1, 1, 4, 1))
         qh = (qh & 0x03).reshape((n_blocks, -1, 32))
         q = (ql | (qh << 4)).to(torch.int8) - 32
         q = q.reshape((n_blocks, QK_K // 16, -1))
