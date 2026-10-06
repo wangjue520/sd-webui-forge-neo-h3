@@ -147,7 +147,7 @@ def _materialize(sd: dict):
     available = psutil.virtual_memory().available
     if size == 0:
         return
-    if available < size * 1.5 + 8 * 2**30:
+    if available - size < 20 * 2**30:  # leave room for the other H3 components and the rest of the system
         logger.warning(f"not enough free RAM to cache {size / 2**30:.1f} GB of GGUF weights ({available / 2**30:.1f} GB free); reloads will read the disk")
         return
     for v in tensors:
