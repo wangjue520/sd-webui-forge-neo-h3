@@ -311,6 +311,21 @@ def load_minimax_h3(path: str, additional_state_dicts: list[str] = None) -> "Min
 # region Engine
 
 
+class _RuntimeLoRA:
+    """forward hook: out + scale * B(A x); A / B are cached on the input's device and dtype"""
+
+    def __init__(self, A: torch.Tensor, B: torch.Tensor, scale: float):
+        self.A, self.B, self.scale = A, B, scale
+        self.cache = None
+
+    def __call__(self, module, inputs, output):
+        x = inputs[0]
+        if self.cache is None or self.cache[0].device != x.device or self.cache[0].dtype != x.dtype:
+            self.cache = (self.A.to(device=x.device, dtype=x.dtype), self.B.to(device=x.device, dtype=x.dtype))
+        A, B = self.cache
+        return output + F.linear(F.linear(x, A), B).mul_(self.scale).to(output.dtype)
+
+
 class MiniMaxH3(ForgeDiffusionEngine):
     matched_guesses = []
 
@@ -332,6 +347,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         self.transformer = ModelPatcher(transformer, load_device=load_device, offload_device=memory_management.unet_offload_device())
         self.transformer_original = self.transformer
         self.lora_hash = str([])
+        self.lora_hooks = []
         self.text_encoder = ModelPatcher(text_encoder, load_device=memory_management.text_encoder_device(), offload_device=memory_management.text_encoder_offload_device())
         self.vae = ModelPatcher(vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
         self.audio_vae = None if audio_vae is None else ModelPatcher(audio_vae, load_device=memory_management.vae_device(), offload_device=memory_management.vae_offload_device())
@@ -378,8 +394,15 @@ class MiniMaxH3(ForgeDiffusionEngine):
         online = getattr(dit, "quantized", False)
         key_map = self._lora_key_map()
 
+        for handle in self.lora_hooks:
+            handle.remove()
+        self.lora_hooks.clear()
+
         for path, strength in loras:
             lora_sd = utils.load_torch_file(path)
+            if online and self._add_runtime_lora(dit, lora_sd, key_map, float(strength), path):
+                del lora_sd
+                continue
             patches, unmatched = load_lora(lora_sd, key_map)
             if unmatched:
                 logger.info(f"LoRA \"{os.path.basename(path)}\": {len(unmatched)} unmatched keys")
@@ -393,6 +416,35 @@ class MiniMaxH3(ForgeDiffusionEngine):
         self.transformer = patcher
         self.forge_objects.unet = patcher
         self.forge_objects_after_applying_lora = self.forge_objects.shallow_copy()
+
+    def _add_runtime_lora(self, dit: torch.nn.Module, lora_sd: dict, key_map: dict, strength: float, path: str) -> bool:
+        """
+        quantized (GGUF / int8 / nvfp4) DiT: apply plain LoRAs as a low-rank side path, out += s * B(A x),
+        instead of re-merging B @ A into every dequantized weight on every forward (Forge's online patching)
+        """
+        pairs = {}
+        for k in lora_sd:
+            for down, up in ((".lora_A.weight", ".lora_B.weight"), (".lora_down.weight", ".lora_up.weight")):
+                if k.endswith(down) and k[: -len(down)] + up in lora_sd:
+                    pairs[k[: -len(down)]] = (lora_sd[k], lora_sd[k[: -len(down)] + up], lora_sd.get(k[: -len(down)] + ".alpha", None))
+        if not pairs or len(pairs) * 2 < sum(1 for k in lora_sd if k.endswith(".weight")):
+            return False  # not a plain LoRA (LoHa / LoKr / diff ...): use Forge's patching
+
+        matched = 0
+        for base, (A, B, alpha) in pairs.items():
+            if (target := key_map.get(base, None)) is None:
+                continue
+            module = dit.get_submodule(target[: -len(".weight")])
+            rank = A.shape[0]
+            scale = strength * ((float(alpha) / rank) if alpha is not None else 1.0)
+            self.lora_hooks.append(module.register_forward_hook(_RuntimeLoRA(A, B, scale)))
+            matched += 1
+
+        if matched == 0:
+            logger.warning(f'LoRA "{os.path.basename(path)}" matched no MiniMax-H3 weights (use the ComfyUI-format file)')
+        else:
+            logger.info(f'Loaded LoRA "{os.path.basename(path)}" ({matched} layers, strength {strength}, runtime low-rank)')
+        return True
 
     def get_learned_conditioning(self, prompt: list[str]):
         raise NotImplementedError("MiniMax-H3 runs through modules_forge.minimax_h3")
