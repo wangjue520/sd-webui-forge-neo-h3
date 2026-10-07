@@ -655,7 +655,11 @@ class _RuntimeLoRA:
         if self.cache is None or self.cache[0].device != x.device or self.cache[0].dtype != x.dtype:
             self.cache = (self.A.to(device=x.device, dtype=x.dtype), self.B.to(device=x.device, dtype=x.dtype))
         A, B = self.cache
-        return output + F.linear(F.linear(x, A), B).mul_(self.scale).to(output.dtype)
+        # accumulate in place: `output + B(A x)` allocated two extra output-sized tensors per layer (1 GB each at
+        # 960x576x5s), which fragmented VRAM until a step ran out of memory with 6 GB cached but unusable
+        out = output.view(-1, output.shape[-1])
+        out.addmm_(F.linear(x, A).view(-1, A.shape[0]).to(out.dtype), B.t().to(out.dtype), alpha=self.scale)
+        return output
 
 
 class MiniMaxH3(ForgeDiffusionEngine):
@@ -839,7 +843,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         device = self.text_encoder.load_device
         # bf16, ~1 GB transient (more with reference images / videos for the vision tower)
-        hidden, tags = run_on_gpu(self.text_encoder, lambda: te.encode(entries, device), inference_memory=2.5 * 2**30, stage="text encoder")
+        hidden, tags = run_on_gpu(self.text_encoder, lambda: te.encode(entries, device), inference_memory=4 * 2**30, stage="text encoder")
         if not torch.isfinite(hidden).all():
             logger.warning("[Self-heal] NaN / Inf in the text encoder output; re-encoding in fp32")
             hidden, tags = te.encode(entries, device, dtype=torch.float32)
@@ -1113,13 +1117,19 @@ class MiniMaxH3(ForgeDiffusionEngine):
             timestep = (sv * 1000.0).view(1).to(device)
             if fun_control is not None:
                 fun_control.active = control["start"] <= i / int(steps) < control["end"]
-            for attempt in range(3):
+            for attempt in range(4):
                 try:
                     out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload)
                     break
                 except torch.OutOfMemoryError:
-                    if attempt == 2:
+                    if attempt == 3:
                         raise
+                    if attempt == 0:
+                        # usually fragmentation (GBs cached in unusable pieces): release the cache and retry the step as is,
+                        # before falling back to streaming the DiT (much slower)
+                        logger.warning(f"[Self-heal] out of VRAM at step {i + 1}; releasing the allocator cache and retrying")
+                        torch.cuda.empty_cache()
+                        continue
                     # self-heal: free the cache, reload the DiT with a larger activation reserve (streams more weights)
                     inference_memory *= 2
                     logger.warning(f"[Self-heal] out of VRAM at step {i + 1}; reloading the transformer with {inference_memory / 2**30:.1f} GB reserved and retrying")
