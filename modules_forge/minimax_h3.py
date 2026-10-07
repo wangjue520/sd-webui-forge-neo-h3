@@ -31,6 +31,68 @@ def set_reference_images(tabname: str, files: list | None):
     reference_images[tabname] = _paths(files)
 
 
+# region ControlNet preprocessing
+
+# label shown in the UI -> Forge preprocessor name (modules_forge.shared.supported_preprocessors)
+CONTROL_PREPROCESSORS = {
+    "姿态 Pose (DWPose)": "dw_openpose_full",
+    "姿态 Pose (OpenPose)": "openpose_full",
+    "深度 Depth (Depth Anything V2)": "depth_anything_v2",
+    "深度 Depth (MiDaS)": "depth_midas",
+    "线稿 Canny": "canny",
+    "线稿 Lineart (写实)": "lineart_realistic",
+    "线稿 Lineart (动漫)": "lineart_anime",
+    "软边缘 SoftEdge (PiDiNet)": "softedge_pidinet",
+    "涂鸦 Scribble (PiDiNet)": "scribble_pidinet",
+    "无 / 已处理好的控制视频": None,
+}
+
+
+def preprocess_video(frames: torch.Tensor, label: str, resolution: int) -> torch.Tensor:
+    """[T, H, W, 3] in [0, 1] -> control frames of the same size, extracted frame by frame with a Forge preprocessor"""
+    import cv2
+
+    from backend import memory_management
+    from modules.shared import state
+    from modules_forge.shared import supported_preprocessors
+
+    name = CONTROL_PREPROCESSORS.get(label, label)
+    if name is None:
+        return frames
+    pre = supported_preprocessors.get(name, None)
+    if pre is None:
+        raise ValueError(f'ControlNet preprocessor "{name}" is not available')
+
+    s1 = pre.slider_1.value if getattr(pre.slider_1, "visible", False) else None
+    s2 = pre.slider_2.value if getattr(pre.slider_2, "visible", False) else None
+    # legacy preprocessors unload their model after every call: keep it for the whole clip
+    unload = getattr(pre, "unload_function", None)
+    if unload is not None:
+        pre.unload_function = None
+    out = []
+    h, w = frames.shape[1:3]
+    try:
+        state.textinfo = f"ControlNet preprocessing ({name})"
+        for i, f in enumerate((frames.numpy() * 255).round().astype(np.uint8)):
+            if state.interrupted:
+                raise RuntimeError("interrupted")
+            r = pre(f, resolution, slider_1=s1, slider_2=s2)
+            r = np.asarray(r)
+            if r.ndim == 2:
+                r = np.repeat(r[..., None], 3, axis=-1)
+            if r.shape[:2] != (h, w):
+                r = cv2.resize(r[..., :3], (w, h), interpolation=cv2.INTER_LINEAR)
+            out.append(r[..., :3])
+            state.sampling_step, state.sampling_steps = i + 1, len(frames)
+    finally:
+        if unload is not None:
+            pre.unload_function = unload
+            unload()
+        memory_management.soft_empty_cache()
+    print(f"[MiniMax-H3] ControlNet preprocessing: {len(out)} frames with {name}")
+    return torch.from_numpy(np.stack(out).astype(np.float32) / 255.0)
+
+
 # region Media (ffmpeg)
 
 
@@ -287,11 +349,18 @@ def process_images(p) -> "Processed":
             print(f"[MiniMax-H3] failed to read frame guide {path}: {e}")
     if guides:
         p.extra_generation_params["Frame Guides"] = ", ".join(f"{s}s" for _, s in options["guides"])
-    control = None
+    control, control_preview = None, None
     if (c := options.get("control")) and c.get("model"):
         control = {"model": c["model"], "strength": c["strength"], "start": c["start"], "end": c["end"], "video": None, "mask": None, "source": None}
         if c.get("video"):
-            control["video"] = load_video(c["video"])
+            from backend.diffusion_engine.minimax_h3 import align_frame_count
+
+            video = load_video(c["video"])[: align_frame_count(length)]  # only the frames the generation uses
+            if c.get("preprocessor") and CONTROL_PREPROCESSORS.get(c["preprocessor"], c["preprocessor"]) is not None:
+                video = preprocess_video(video, c["preprocessor"], resolution=min(p.width, p.height))
+                control_preview = [f for f in (video.numpy() * 255).round().astype(np.uint8)]
+                p.extra_generation_params["Control Preprocessor"] = CONTROL_PREPROCESSORS.get(c["preprocessor"], c["preprocessor"])
+            control["video"] = video
         if c.get("mask"):
             control["mask"] = load_video(c["mask"]).mean(dim=-1)  # white = regenerate
             if c.get("source"):
@@ -406,6 +475,10 @@ def process_images(p) -> "Processed":
             if audio_path is not None and os.path.isfile(audio_path):
                 os.remove(audio_path)
         print(f"[MiniMax-H3] saved {len(video)} frames ({len(video) / FPS:.2f}s) to {video_path}")
+        if control_preview is not None and n == 0:
+            # the extracted control video (pose / depth / lines ...), to check the preprocessing
+            control_path = images.save_video(p, control_preview, fps=FPS, basename="control")
+            print(f"[MiniMax-H3] control video saved to {control_path}")
 
         preview = Image.fromarray(video[0])
         if opts.enable_pnginfo:

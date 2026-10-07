@@ -115,12 +115,13 @@ class MiniMaxH3Video(scripts.Script):
                 guide_times = gr.Textbox(label="Times (seconds)", placeholder="例如: 1.0, 2.5, -0.5", lines=1)
 
             with gr.Tab("ControlNet 控制"):
-                gr.Markdown("Fun ControlNet-Union：上传已处理好的控制视频（姿态骨架 / 深度 / 线稿等），或用遮罩做视频局部重绘（遮罩白色 = 重新生成，源视频提供其余部分）。模型放在 MOD\\model_patches。")
+                gr.Markdown("Fun ControlNet-Union：上传普通视频，选择预处理（姿态 / 深度 / 线稿…）自动逐帧提取控制信号；或用遮罩做视频局部重绘（遮罩白色 = 重新生成，源视频提供其余部分）。提取出的控制视频会另存一份（文件名带 control）便于检查。模型放在 MOD\\model_patches。")
                 with gr.Row():
                     cn_model = gr.Dropdown(label="ControlNet Model", choices=list_controlnets(), value="None")
                     cn_refresh = gr.Button("🔄", scale=0, min_width=40)
+                cn_pre = gr.Dropdown(label="预处理 / Preprocessor", choices=list(minimax_h3.CONTROL_PREPROCESSORS), value="姿态 Pose (DWPose)")
                 with gr.Row():
-                    cn_video = gr.File(label="Control Video (pose / depth / canny ...)", file_types=["video"], type="filepath", height=96)
+                    cn_video = gr.File(label="Control Video（普通视频即可）", file_types=["video"], type="filepath", height=96)
                     cn_mask = gr.File(label="Inpaint Mask (video or image)", file_types=["video", "image"], type="filepath", height=96)
                     cn_source = gr.File(label="Source Video (for inpaint)", file_types=["video"], type="filepath", height=96)
                 with gr.Row():
@@ -147,11 +148,11 @@ class MiniMaxH3Video(scripts.Script):
                     upscale_by = gr.Slider(label="Scale", minimum=1.0, maximum=4.0, step=0.25, value=2.0)
 
         minimax_h3.ui_panels.append(panel)
-        return [keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files, guide_times, cn_model, cn_video, cn_mask, cn_source, cn_strength, cn_start, cn_end]
+        return [keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files, guide_times, cn_model, cn_video, cn_mask, cn_source, cn_strength, cn_start, cn_end, cn_pre]
 
-    def before_process(self, p, keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files=None, guide_times="", cn_model="None", cn_video=None, cn_mask=None, cn_source=None, cn_strength=1.0, cn_start=0.0, cn_end=1.0, *args, **kwargs):
+    def before_process(self, p, keyframes, segment_prompts, turbo, turbo_lora, turbo_strength, turbo_steps, turbo_shift, upscaler, upscale_by, guide_files=None, guide_times="", cn_model="None", cn_video=None, cn_mask=None, cn_source=None, cn_strength=1.0, cn_start=0.0, cn_end=1.0, cn_pre=None, *args, **kwargs):
         if cn_model not in (None, "None") and (cn_video or cn_mask):
-            _options(p)["control"] = {"model": find_controlnet(cn_model), "video": cn_video, "mask": cn_mask, "source": cn_source, "strength": float(cn_strength), "start": float(cn_start), "end": float(cn_end)}
+            _options(p)["control"] = {"model": find_controlnet(cn_model), "video": cn_video, "mask": cn_mask, "source": cn_source, "strength": float(cn_strength), "start": float(cn_start), "end": float(cn_end), "preprocessor": cn_pre}
         files = sorted(guide_files or [])
         times = [t.strip() for t in (guide_times or "").replace("，", ",").split(",") if t.strip()]
         if files and len(times) != len(files):
