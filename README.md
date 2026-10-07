@@ -9,7 +9,7 @@
 
 本仓库基于 [Haoming02/sd-webui-forge-classic](https://github.com/Haoming02/sd-webui-forge-classic)（Forge **Neo** 分支），在 `minimax-h3` 分支上加入了 **MiniMax-H3**（33B 音视频联合生成模型）的完整支持，并针对消费级显卡（12GB 起）做了显存 / 内存优化。Forge Neo 原有的全部功能保持不变，切换 UI Preset 即可在出图和出视频之间切换。
 
-## ✨ 功能
+##  功能
 
 ### 生成模式
 | 功能 | 入口 | 模型 |
@@ -38,7 +38,7 @@
 - **溢出自愈**（出图和出视频都有效）：逐步检测 NaN / Inf，自动以 fp32 注意力、重新加载模型、fp32 VAE 重试，避免黑图 / 鬼图；显存不足时自动降级重试
 - **显存 / 内存管理**：各大组件轮流使用显卡、扣除其他程序占用的显存、显存上限保护，64GB 内存可稳定运行
 
-## 📦 模型
+##  模型
 
 | 类型 | 文件 | 放到 |
 |---|---|---|
@@ -55,7 +55,7 @@
 
 **配置参考**：GGUF Q4 一套约 33GB 内存；12GB 显卡可运行（显存不足的部分自动从内存流式加载），24GB 显卡更流畅。
 
-## 🚀 使用
+##  使用
 
 1. 安装方式与 Forge Neo 相同，见 [原版说明 / Installation](README_Forge_Neo.md#installation)，克隆时使用本仓库的 `minimax-h3` 分支
 2. 顶部 **UI Preset** 选 `h3`
@@ -66,7 +66,7 @@
 
 参考速度（RTX 3090，GGUF Q4，Turbo 8 步）：640×352、1.6 秒约 30 秒；448×576、2.3 秒约 1 分钟。
 
-## ⚠️ 已知限制
+##  已知限制
 - Schedule Type 对 H3 无效（H3 使用自己的噪声调度）
 - 中间帧引导与 Turbo LoRA 同时使用时过渡容易生硬，建议关闭 Turbo
 - 长视频每段仍可能自行转场 / 转镜头，用「分段提示词」描述每段内容可以约束；续写段比首段多生成 39 帧，每段约慢 25%
@@ -74,7 +74,7 @@
 - 实时预览为潜空间线性近似
 - 目前主要在 RTX 3090 上以 2–3 秒、≤960×576 测试
 
-## 🙏 致谢与许可
+##  致谢与许可
 - [Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic) by **Haoming02**，[Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge) by **lllyasviel**，[Stable Diffusion WebUI](https://github.com/AUTOMATIC1111/stable-diffusion-webui) by **AUTOMATIC1111**
 - 长视频续写的接续 / 校色方法参考 [ComfyUI-MAINodes](https://github.com/matlowai/ComfyUI-MAINodes)（matlowai）
 - [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) by **MiniMax**；模型实现移植自 [ComfyUI](https://github.com/Comfy-Org/ComfyUI) 与 [diffusers](https://github.com/huggingface/diffusers)
