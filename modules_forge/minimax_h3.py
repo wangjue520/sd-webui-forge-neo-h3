@@ -67,11 +67,11 @@ def create_reference_tab(tabname: str):
     with gr.Tab("参考图 / Reference", id=f"{tabname}_h3_references", elem_id=f"{tabname}_h3_references_tab", visible=shared.opts.forge_preset == "h3") as tab:
         gr.Markdown("参考图生视频（Reference-to-Video）：上传 1~9 张参考图，在提示词中可用 Picture 1、Picture 2… 指代。需使用 Ref2VA 模型；留空则为普通文生 / 图生视频。")
         files = gr.File(label="Reference Images", file_count="multiple", file_types=["image"], type="filepath", elem_id=f"{tabname}_h3_references")
-        gallery = gr.Gallery(label="Preview", columns=6, height=240, interactive=False, elem_id=f"{tabname}_h3_references_preview")
+        gallery = gr.Gallery(label="Preview", columns=6, height=240, interactive=False, visible=False, elem_id=f"{tabname}_h3_references_preview")
 
         def on_change(f):
             set_reference_images(tabname, f)
-            return reference_images[tabname]
+            return gr.update(value=reference_images[tabname], visible=bool(reference_images[tabname]))
 
         files.change(on_change, inputs=[files], outputs=[gallery], queue=False, show_progress=False)
 

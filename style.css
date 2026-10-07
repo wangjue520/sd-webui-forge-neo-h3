@@ -1832,3 +1832,21 @@ div.xyz_entries button.secondary {
 #swap_axes button {
     border-radius: 8px;
 }
+
+/* MiniMax-H3 (UI Preset: h3): controls that do nothing for video generation, see javascript/minimax_h3.js */
+body.forge-preset-h3 #txt2img_accordions,
+body.forge-preset-h3 #img2img_accordions,
+body.forge-preset-h3 #txt2img_neg_prompt_row,
+body.forge-preset-h3 #img2img_neg_prompt_row,
+body.forge-preset-h3 #txt2img_cfg_scale,
+body.forge-preset-h3 #img2img_cfg_scale,
+body.forge-preset-h3 #txt2img_scheduler,
+body.forge-preset-h3 #img2img_scheduler,
+body.forge-preset-h3 #resize_mode,
+body.forge-preset-h3 #img2img_denoising_strength,
+body.forge-preset-h3 #img2img_tab_resize_by-button,
+body.forge-preset-h3 #txt2img_controlnet,
+body.forge-preset-h3 #img2img_controlnet,
+body.forge-preset-h3 .h3-hidden {
+    display: none !important;
+}

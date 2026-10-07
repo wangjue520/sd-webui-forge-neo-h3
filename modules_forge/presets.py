@@ -111,6 +111,11 @@ FRAME_SLIDERS = {
     PresetArch.h3.name: {"minimum": 5, "maximum": 362, "step": 17},
 }
 
+# MiniMax-H3: 64-aligned (UI step) near 16:9; ~2.3x faster than the native 1344x768
+DEFAULT_SIZE = {
+    PresetArch.h3.name: (960, 576),
+}
+
 DEFAULT_FRAMES = {
     PresetArch.h3.name: 124,  # ~5 seconds
 }
@@ -262,12 +267,12 @@ def register(options_templates: dict):
                 (f"ui_{name}", name.upper(), "presets"),
                 {
                     f"{name}_t2i_dim1": OptionRow(),
-                    f"{name}_t2i_width": OptionInfo(0, "txt2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
-                    f"{name}_i2i_width": OptionInfo(0, "img2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_t2i_width": OptionInfo(DEFAULT_SIZE.get(name, (0, 0))[0], "txt2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_i2i_width": OptionInfo(DEFAULT_SIZE.get(name, (0, 0))[0], "img2img Width", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
                     f"{name}_t2i_dim0": OptionRow(),
                     f"{name}_i2i_dim1": OptionRow(),
-                    f"{name}_t2i_height": OptionInfo(0, "txt2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
-                    f"{name}_i2i_height": OptionInfo(0, "img2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_t2i_height": OptionInfo(DEFAULT_SIZE.get(name, (0, 0))[1], "txt2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
+                    f"{name}_i2i_height": OptionInfo(DEFAULT_SIZE.get(name, (0, 0))[1], "img2img Height", Slider, {"minimum": 0, "maximum": 2048, "step": 64}),
                     f"{name}_i2i_dim0": OptionRow(),
                 },
             )

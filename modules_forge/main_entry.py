@@ -260,6 +260,10 @@ def forge_main_entry():
     ).then(js="clickLoraRefresh", fn=None, queue=False, show_progress=False)
     Context.root_block.load(on_preset_change, inputs=[ui_forge_preset], outputs=output_targets, queue=False, show_progress=False)
 
+    # MiniMax-H3: hide the controls that do nothing for video generation (javascript/minimax_h3.js + style.css)
+    ui_forge_preset.change(fn=None, js="h3PresetChanged", inputs=[ui_forge_preset], queue=False, show_progress=False)
+    Context.root_block.load(fn=None, js="h3PresetChanged", inputs=[ui_forge_preset], queue=False, show_progress=False)
+
     refresh_model_loading_parameters()
 
 
