@@ -435,16 +435,18 @@ class _FileBackedPatcher(ModelPatcher):
                 if t is not None and t.device.type == "cpu":
                     # keep the CPU storage too: nn.Module._apply moves ordinary parameters in place (param.data = ...),
                     # so the object alone would follow the weights onto the GPU (GGUF parameters are replaced instead)
-                    self._originals[(module_name, name)] = (t, t.data)
+                    self._originals[(module_name, name)] = (t, t.data, getattr(t, "baked", None))
 
     def _restore_originals(self):
         modules = dict(self.model.named_modules())
-        for (module_name, name), (t, data) in self._originals.items():
+        for (module_name, name), (t, data, baked) in self._originals.items():
             module = modules.get(module_name, None)
             if module is None:
                 continue
             if t.data.data_ptr() != data.data_ptr():
                 t.data = data
+                if baked is not None:
+                    t.baked = baked  # baking happened in place on the GPU copy: the original data is unbaked again
             if name in module._parameters:
                 module._parameters[name] = t
             elif name in module._buffers:
@@ -837,7 +839,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         device = self.text_encoder.load_device
         # bf16, ~1 GB transient (more with reference images / videos for the vision tower)
-        hidden, tags = run_on_gpu(self.text_encoder, lambda: te.encode(entries, device), inference_memory=1.5 * 2**30, stage="text encoder")
+        hidden, tags = run_on_gpu(self.text_encoder, lambda: te.encode(entries, device), inference_memory=2.5 * 2**30, stage="text encoder")
         if not torch.isfinite(hidden).all():
             logger.warning("[Self-heal] NaN / Inf in the text encoder output; re-encoding in fp32")
             hidden, tags = te.encode(entries, device, dtype=torch.float32)
@@ -1076,8 +1078,10 @@ class MiniMaxH3(ForgeDiffusionEngine):
         # activations of the packed sequence (hidden 5376, qkv 3x, mlp 2x14336) + a dequantized weight in flight
         tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs if r.get("latent") is not None) + sum(int(r.get("ref_audio_t", 0)) * 2 for r in refs)
         timer("vae encode")
-        # measured ~1.2 MB of activations (incl. GGUF dequant temporaries) per packed token on a 3090
-        inference_memory = tokens * 1.25 * 2**20 + 2 * 2**30
+        # a DiT block peaks at ~105 KB per packed token (measured, bf16); 0.25 MB leaves headroom for the rest of the
+        # forward, plus 3 GB for GGUF dequant temporaries / LoRA / cuBLAS workspaces (an OOM retries with a larger reserve).
+        # the old 1.25 MB/token was fitted on small clips and pushed the whole DiT out of VRAM at 960x576x5s (~20k tokens)
+        inference_memory = tokens * 0.25 * 2**20 + 3 * 2**30
         dit_patchers = [self.transformer] + ([fun_control.patcher] if fun_control is not None else [])
         if fun_control is not None:
             inference_memory += 1 * 2**30  # control stream
