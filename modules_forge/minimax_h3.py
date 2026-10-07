@@ -31,6 +31,49 @@ def set_reference_images(tabname: str, files: list | None):
     reference_images[tabname] = _paths(files)
 
 
+# region Long video
+
+# frames of the previous segment each continuation re-renders as its frozen opening (MAINodes' measured atom:
+# 39 = 17x2 + 5 is token-exact on the 17k+5 grid and a whole number of 40 Hz audio ticks; the seam MAE drops
+# from 16.5 to 2.2 / 255 against a last-frame-only join)
+SEGMENT_HANDLE = 39
+# a continuation whose first new frame differs from the last carried one this many times more than its frames
+# usually differ is a shot change (measured: 74 vs ~9 for a cut, 11 for a clean join); retried with other seeds
+CUT_FACTOR, CUT_RETRIES = 4.0, 2
+
+
+def _cut_score(frames: torch.Tensor, handle: int) -> tuple[float, float]:
+    """(difference across the join, median frame-to-frame difference of the new material), 0-255 scale, downsampled"""
+    small = torch.nn.functional.interpolate(frames.movedim(-1, 1).float(), size=(72, 120), mode="area") * 255.0
+    diffs = (small[1:] - small[:-1]).abs().mean(dim=(1, 2, 3))
+    jump = float(diffs[handle - 1])
+    typical = float(diffs[handle:].median()) if len(diffs) > handle else jump
+    return jump, max(typical, 2.0)
+
+
+def _seam_normalize(source_tail: torch.Tensor, rendered_tail: torch.Tensor, frames: torch.Tensor, max_gain: float = 1.25) -> torch.Tensor:
+    """
+    MAINodes' H3 Seam Normalize: the continuation rendered the carried tail again; per-channel linear-light gains
+    that map that rendering onto the accepted tail are applied to the new frames (removes the VAE round-trip
+    darkening and the colour drift at the cut)
+    """
+
+    def to_linear(x):
+        return torch.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+    def to_srgb(x):
+        return torch.where(x <= 0.0031308, x * 12.92, 1.055 * x.clamp(min=0) ** (1 / 2.4) - 0.055)
+
+    n = min(len(source_tail), len(rendered_tail))
+    if n == 0 or len(frames) == 0:
+        return frames
+    src = to_linear(source_tail[-n:].float().clamp(0, 1)).reshape(-1, 3)
+    gen = to_linear(rendered_tail[:n].float().clamp(0, 1)).reshape(-1, 3)
+    gains = ((src.median(0).values + 1e-4) / (gen.median(0).values + 1e-4)).clamp(1 / max_gain, max_gain)
+    print(f"[MiniMax-H3] seam colour gains R {gains[0]:.3f} G {gains[1]:.3f} B {gains[2]:.3f}")
+    return to_srgb(to_linear(frames.float().clamp(0, 1)) * gains).clamp(0, 1)
+
+
 # region ControlNet preprocessing
 
 # label shown in the UI -> Forge preprocessor name (modules_forge.shared.supported_preprocessors)
@@ -382,6 +425,7 @@ def process_images(p) -> "Processed":
     segment_prompts: list[str] = options.get("segment_prompts", [])
     if num_segments > 1:
         p.extra_generation_params["Segments"] = num_segments
+        p.extra_generation_params["Segment handle"] = SEGMENT_HANDLE
 
     if state.job_count == -1:
         state.job_count = p.n_iter * num_segments
@@ -411,6 +455,7 @@ def process_images(p) -> "Processed":
         video: list[np.ndarray] = []
         audio_parts: list[torch.Tensor] = []
         start = first_frame
+        previous = None  # (frames, audio) of the previous segment, continued through its last SEGMENT_HANDLE frames
 
         for i in range(num_segments):
             if state.interrupted or state.stopping_generation:
@@ -429,32 +474,56 @@ def process_images(p) -> "Processed":
             else:
                 prompt = prompts[n]
 
-            frames, audio = model.generate(
-                prompt=prompt,
-                width=p.width,
-                height=p.height,
-                length=length,
-                steps=steps,
-                seed=p.seeds[0] + i,
-                first_frame=start,
-                last_frame=end,
-                references=references,
-                callback=callback,
-                sampler=p.sampler_name,
-                preview=_preview if opts.live_previews_enable else None,
-                ref_videos=ref_videos,
-                ref_audios=ref_audios,
-                guides=guides if i == 0 else None,  # guide times refer to the first segment
-                control=control if num_segments == 1 else None,
-            )
+            prefix = None
+            if previous is not None:
+                prev_frames, prev_audio = previous
+                handle = min(SEGMENT_HANDLE, len(prev_frames))
+                tail_audio = None
+                if prev_audio is not None:
+                    a = round((len(prev_frames) - handle) * samples_per_frame)
+                    tail_audio = prev_audio[:, a : a + round(handle * samples_per_frame)]
+                prefix = {"video": prev_frames[-handle:], "audio": tail_audio}
+                start = None
 
-            # the first frame of a continuation repeats the previous segment's last frame
-            skip = 1 if i > 0 else 0
-            start = frames[-1].clone()
-            frames = frames[skip:]
-            video.extend(f for f in frames.mul(255.0).round().clamp(0, 255).to(torch.uint8).numpy())
+            for attempt in range(1 + CUT_RETRIES if prefix else 1):
+                frames, audio = model.generate(
+                    # H3 learnt from edited footage: after the carried opening it may start a new shot on its own
+                    prompt=(prompt.rstrip().rstrip(".") + ". One continuous shot, the camera does not cut.") if prefix else prompt,
+                    width=p.width,
+                    height=p.height,
+                    # handle (17x2 + 5) + a multiple of 17 lands on the 17k+5 grid: no surplus frames to render and drop
+                    length=(len(prefix["video"]) + max(17, round(length / 17) * 17)) if prefix else length,
+                    steps=steps,
+                    seed=p.seeds[0] + i + 1000 * attempt,
+                    first_frame=start,
+                    last_frame=end,
+                    references=references,
+                    callback=callback,
+                    sampler=p.sampler_name,
+                    preview=_preview if opts.live_previews_enable else None,
+                    ref_videos=ref_videos,
+                    ref_audios=ref_audios,
+                    guides=guides if i == 0 else None,  # guide times refer to the first segment
+                    control=control if num_segments == 1 else None,
+                    prefix=prefix,
+                )
+                if not prefix or state.interrupted or state.stopping_generation:
+                    break
+                jump, typical = _cut_score(frames, len(prefix["video"]))
+                if jump <= CUT_FACTOR * typical:
+                    break
+                print(f"[MiniMax-H3] segment {i + 1} cuts to a new shot after the carried frames (jump {jump:.1f} vs typical {typical:.1f})"
+                        + ("; regenerating with another seed" if attempt < CUT_RETRIES else "; keeping it"))
+            previous = (frames, audio)
+
+            # a continuation re-renders the carried tail first: drop it, and use it to conform the colours
+            skip = len(prefix["video"]) if prefix else 0
+            kept = frames[skip:]
+            if prefix:
+                kept = _seam_normalize(prefix["video"], frames[:skip], kept)
+            video.extend(f for f in kept.mul(255.0).round().clamp(0, 255).to(torch.uint8).numpy())
             if audio is not None:
-                a, b = round(skip * samples_per_frame), round((skip + len(frames)) * samples_per_frame)
+                a, b = round(skip * samples_per_frame), round((skip + len(kept)) * samples_per_frame)
                 audio_parts.append(audio[:, a:b])
             state.nextjob()
 

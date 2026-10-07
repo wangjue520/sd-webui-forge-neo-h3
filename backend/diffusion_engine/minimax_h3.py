@@ -959,15 +959,18 @@ class MiniMaxH3(ForgeDiffusionEngine):
         ref_audios: list[torch.Tensor] = None,
         guides: list[tuple[int, torch.Tensor]] = None,
         control: dict = None,
+        prefix: dict = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         returns (frames [F, H, W, C] in [0, 1], waveform [2, L] at 32kHz or None)
         callback(step, total) -> True to interrupt
+        prefix: {"video": [N, H, W, C] (N = 17k + 5), "audio": [2, L] or None}, the tail of a previous segment that
+        this one continues: kept as the opening N frames (per-token frozen), its audio as a guide at frame 0
         """
         with vram_cap():
-            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios, guides, control)
+            return self._generate(prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler, preview, ref_videos, ref_audios, guides, control, prefix)
 
-    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None, guides=None, control=None):
+    def _generate(self, prompt, width, height, length, steps, seed, first_frame, last_frame, references, callback, sampler="Euler", preview=None, ref_videos=None, ref_audios=None, guides=None, control=None, prefix=None):
         width, height = snap(width), snap(height)
         frame_count = align_frame_count(length)
         latent_t = video_latent_t(frame_count)
@@ -1060,6 +1063,19 @@ class MiniMaxH3(ForgeDiffusionEngine):
                     item["kind"] = "video_audio"
             item.pop("_audio", None)
 
+        prefix_latent = None
+        if prefix is not None:
+            # continuation (MAINodes' H3 extension, masked anchor): the previous segment's tail is written into the
+            # opening latent frames and frozen per token; its audio rides an audio-only guide at frame 0
+            pv = prefix["video"]
+            if pv.shape[1:3] != (height, width):
+                pv = torch.stack([resize_image(f, width, height, crop=True) for f in pv])
+            prefix_latent = self.vae_encode_video(pv)
+            if prefix.get("audio") is not None and self.audio_vae is not None:
+                keyframes.append({"resolved_frame_index": 0, "latent": None, "audio_latent": self.audio_encode(prefix["audio"])})
+            logger.info(f"[MiniMax-H3] continuing from {pv.shape[0]} frames of the previous segment")
+            timer("prefix encode")
+
         fun_control = self._prepare_control(control, frame_count, latent_t, width, height) if control else None
         if fun_control is not None:
             timer("control encode")
@@ -1067,7 +1083,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         payload = {
             "text_token_tags": tags,
             "seed": int(seed),
-            "cond_video_latents": [k["latent"] for k in keyframes] + [r["latent"] for r in refs if r.get("latent") is not None],
+            "cond_video_latents": [k["latent"] for k in keyframes if k.get("latent") is not None] + [r["latent"] for r in refs if r.get("latent") is not None],
             "cond_audio_latents": [k["audio_latent"] for k in keyframes if k.get("audio_latent") is not None] + [r["audio_latent"] for r in refs if r.get("audio_latent") is not None],
         }
         if keyframes:
@@ -1080,7 +1096,7 @@ class MiniMaxH3(ForgeDiffusionEngine):
         x_audio = torch.randn((1, 32, 2, audio_t), generator=generator, dtype=torch.float32)
 
         # activations of the packed sequence (hidden 5376, qkv 3x, mlp 2x14336) + a dequantized weight in flight
-        tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs if r.get("latent") is not None) + sum(int(r.get("ref_audio_t", 0)) * 2 for r in refs)
+        tokens = latent_t * (height // 32) * (width // 32) + audio_t * 2 + text_states.shape[1] + sum(int(k["latent"].shape[2]) * (height // 32) * (width // 32) for k in keyframes if k.get("latent") is not None) + sum(int(k["audio_latent"].shape[-1]) * 2 for k in keyframes if k.get("audio_latent") is not None) + sum(int(r["latent"].shape[2] * r["latent"].shape[3] * r["latent"].shape[4] // 4) for r in refs if r.get("latent") is not None) + sum(int(r.get("ref_audio_t", 0)) * 2 for r in refs)
         timer("vae encode")
         # a DiT block peaks at ~105 KB per packed token (measured, bf16); 0.25 MB leaves headroom for the rest of the
         # forward, plus 3 GB for GGUF dequant temporaries / LoRA / cuBLAS workspaces (an OOM retries with a larger reserve).
@@ -1097,6 +1113,19 @@ class MiniMaxH3(ForgeDiffusionEngine):
 
         context = dit.preprocess_text_embeds(text_states.to(device=device, dtype=dtype))
         x_video, x_audio = x_video.to(device), x_audio.to(device)
+
+        denoise_mask, prefix_t = None, 0
+        if prefix_latent is not None:
+            from backend.nn.minimax_h3.model import VISUAL_COND_TIMESTEP
+
+            # ComfyUI's MiniMaxH3.scale_latent_inpaint: preserved rows run at the cond timestep and are injected at
+            # cond strength every step; the DiT pins their labels and zeroes their velocity (mask 0)
+            prefix_t = min(prefix_latent.shape[2], latent_t)
+            clean = prefix_latent[:, :, :prefix_t].to(device)
+            pnoise = torch.randn(clean.shape, generator=torch.Generator("cpu").manual_seed(int(seed) + 2), dtype=torch.float32).to(device)
+            prefix_injected = VISUAL_COND_TIMESTEP * clean + (1.0 - VISUAL_COND_TIMESTEP) * pnoise
+            denoise_mask = torch.ones((1, 1, latent_t, height // 16, width // 16), dtype=torch.float32, device=device)
+            denoise_mask[:, :, :prefix_t] = 0.0
 
         shift_v, shift_a = self.shift, SHIFT_AUDIO
         base = torch.linspace(1.0, 0.0, int(steps) + 1, dtype=torch.float32)
@@ -1117,9 +1146,11 @@ class MiniMaxH3(ForgeDiffusionEngine):
             timestep = (sv * 1000.0).view(1).to(device)
             if fun_control is not None:
                 fun_control.active = control["start"] <= i / int(steps) < control["end"]
+            if denoise_mask is not None:
+                x_video[:, :, :prefix_t] = prefix_injected
             for attempt in range(4):
                 try:
-                    out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload)
+                    out_v, out_a = dit([x_video, x_audio], timestep, context, transformer_options=transformer_options, minimax_payload=payload, denoise_mask=denoise_mask)
                     break
                 except torch.OutOfMemoryError:
                     if attempt == 3:
@@ -1153,6 +1184,8 @@ class MiniMaxH3(ForgeDiffusionEngine):
             callback(int(steps), int(steps))
 
         del context
+        if denoise_mask is not None:
+            x_video[:, :, :prefix_t] = clean
         timer(f"{int(steps)} steps")
         for adapter in self.lora_adapters:
             adapter.cache = None  # the 1.8 GB Turbo LoRA must not stay in VRAM next to the text encoder / VAE

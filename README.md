@@ -21,12 +21,14 @@
 | 参考视频（含原声）/ 参考音频 | 参考图 / Reference 标签 | Ref2VA |
 | 中间帧引导（任意时间点的画面锚点） | MiniMax-H3 Video → 中间帧引导 | 均可 |
 | ControlNet（上传普通视频，自动预处理） | MiniMax-H3 Video → ControlNet 控制 | FL2VA |
+| 人物替换 / 动作迁移（角色图 + 舞蹈视频 → 角色跳同样的舞） | 参考图标签放角色图 + ControlNet 控制放视频（DWPose） | Ref2VA |
 | 视频局部重绘（遮罩 + 源视频） | MiniMax-H3 Video → ControlNet 控制 | FL2VA |
-| 长视频（多段首尾帧串联、分段提示词、关键帧） | 分段数 + MiniMax-H3 Video → 长视频关键帧 | FL2VA |
+| 长视频（多段无缝续写、分段提示词、关键帧） | 分段数 + MiniMax-H3 Video → 长视频关键帧 | FL2VA |
 
 所有模式都会同时生成 **32 kHz 立体声音频**，直接封装进 mp4。
 
 ### 更多
+- **长视频无缝续写**：每段把上一段最后 39 帧（含音频）作为冻结的开头继续生成，动作和声音自然衔接，并按重渲染的 39 帧自动校色；模型自行切镜头时自动检测并换种子重生成（思路来自 [ComfyUI-MAINodes](https://github.com/matlowai/ComfyUI-MAINodes) 的 H3 Extension）
 - **ControlNet 预处理**：DWPose / OpenPose 姿态、Depth Anything V2 / MiDaS 深度、Canny / Lineart / 动漫线稿、软边缘、涂鸦，逐帧自动提取，并另存提取结果便于检查
 - **采样器**：Res Multistep（默认）/ Euler / DPM++ 2M，视频与音频各自按自己的噪声调度（shift 12 / 3）
 - **Turbo 加速**：lightx2v Turbo LoRA（8 步），也支持在提示词中用 `<lora:名字:权重>` 加载 H3 LoRA
@@ -67,12 +69,14 @@
 ## ⚠️ 已知限制
 - Schedule Type 对 H3 无效（H3 使用自己的噪声调度）
 - 中间帧引导与 Turbo LoRA 同时使用时过渡容易生硬，建议关闭 Turbo
+- 长视频每段仍可能自行转场 / 转镜头，用「分段提示词」描述每段内容可以约束；续写段比首段多生成 39 帧，每段约慢 25%
 - 视频局部重绘需要遮罩完整覆盖要替换的主体
 - 实时预览为潜空间线性近似
 - 目前主要在 RTX 3090 上以 2–3 秒、≤960×576 测试
 
 ## 🙏 致谢与许可
 - [Forge Neo](https://github.com/Haoming02/sd-webui-forge-classic) by **Haoming02**，[Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge) by **lllyasviel**，[Stable Diffusion WebUI](https://github.com/AUTOMATIC1111/stable-diffusion-webui) by **AUTOMATIC1111**
+- 长视频续写的接续 / 校色方法参考 [ComfyUI-MAINodes](https://github.com/matlowai/ComfyUI-MAINodes)（matlowai）
 - [MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) by **MiniMax**；模型实现移植自 [ComfyUI](https://github.com/Comfy-Org/ComfyUI) 与 [diffusers](https://github.com/huggingface/diffusers)
 - GGUF 量化：[unsloth](https://huggingface.co/unsloth/MiniMax-H3-GGUF)；Turbo LoRA：[lightx2v](https://huggingface.co/lightx2v/Minimax-h3-Turbo)；ControlNet：[Comfy-Org](https://huggingface.co/Comfy-Org/MiniMax-H3)
 - 代码沿用原项目的 **AGPL-3.0** 许可（见 [LICENSE](LICENSE)）。MiniMax-H3 模型权重适用 **MiniMax H3 Community License**（含地区与商用限制），使用前请自行确认
@@ -85,7 +89,8 @@
 This repository is a fork of [Forge **Neo**](https://github.com/Haoming02/sd-webui-forge-classic) that adds full **MiniMax-H3** (33B joint audio-video model) support on the `minimax-h3` branch, optimized for consumer GPUs (12 GB and up). Everything in Forge Neo keeps working; switch the **UI Preset** to `h3` for video.
 
 **Features**
-- Text-to-video, image-to-video, first/last-frame-to-video, reference-to-video (images, videos with soundtrack, audio), frame guides at any time, long videos (chained segments), all with native **32 kHz stereo audio**
+- Text-to-video, image-to-video, first/last-frame-to-video, reference-to-video (images, videos with soundtrack, audio), frame guides at any time, long videos (each segment continues the last 39 frames + audio of the previous one, with colour matching and automatic shot-cut retry), all with native **32 kHz stereo audio**
+- Character replacement / motion transfer: Ref2VA + a character image + DWPose ControlNet from an ordinary dance video
 - Fun ControlNet-Union from an **ordinary video** with automatic per-frame preprocessing (DWPose / OpenPose / depth / canny / lineart ...), and masked video inpainting
 - Samplers Res Multistep / Euler / DPM++ 2M on separate video and audio schedules; Turbo LoRA (8 steps); live preview; per-frame upscaling
 - A video-focused UI for the `h3` preset (img2img becomes img2video; irrelevant controls are hidden)
