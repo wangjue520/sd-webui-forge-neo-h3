@@ -802,6 +802,11 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
     if p.scripts is not None:
         p.scripts.before_process(p)
 
+    from modules_forge.presets import PROCESS_HOOKS
+
+    if (hook := PROCESS_HOOKS.get(opts.forge_preset)) is not None:
+        return hook(p)
+
     stored_opts = {k: opts.data[k] if k in opts.data else opts.get_default(k) for k in p.override_settings.keys() if k in opts.data}
 
     try:

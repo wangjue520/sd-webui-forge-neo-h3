@@ -18,7 +18,7 @@ from modules import (
     shared_items,
     ui_common,
 )
-from modules_forge.presets import PresetArch, frame_slider, is_video, use_distill, use_shift
+from modules_forge.presets import PresetArch, frame_slider, is_video, preset_checkpoint_tiles, use_distill, use_shift
 
 logger = logging.getLogger("ui_models")
 setup_logger(logger)
@@ -85,7 +85,7 @@ def find_files_with_extensions(base_path: os.PathLike, extensions: list[str]) ->
 
 def refresh_models() -> tuple[list[os.PathLike], list[os.PathLike]]:
     shared_items.refresh_checkpoints()
-    ckpt_list = shared_items.list_checkpoint_tiles(shared.opts.sd_checkpoint_dropdown_use_short)
+    ckpt_list = preset_checkpoint_tiles(shared.opts.forge_preset, shared.opts.sd_checkpoint_dropdown_use_short)
 
     file_extensions = ("ckpt", "pt", "pth", "bin", "safetensors", "sft", "gguf")
 
@@ -300,7 +300,10 @@ def on_preset_change(preset: str):
 
     return [
         # ui_checkpoint, ui_vae, ui_forge_unet_dtype
-        gr.update(value=getattr(shared.opts, f"forge_checkpoint_{preset}", shared.opts.sd_model_checkpoint)),
+        gr.update(
+            value=getattr(shared.opts, f"forge_checkpoint_{preset}", shared.opts.sd_model_checkpoint),
+            choices=sorted(preset_checkpoint_tiles(preset, shared.opts.sd_checkpoint_dropdown_use_short)),
+        ),
         gr.update(value=[os.path.basename(m) for m in getattr(shared.opts, f"forge_additional_modules_{preset}", [])]),
         gr.update(value=getattr(shared.opts, f"forge_unet_storage_dtype_{preset}", "Automatic")),
         # ui_txt2img_steps, ui_txt2img_hr_steps, ui_img2img_steps

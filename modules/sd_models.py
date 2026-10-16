@@ -139,6 +139,11 @@ def list_models():
         checkpoint_info = CheckpointInfo(filename)
         checkpoint_info.register()
 
+    from modules_forge.presets import CHECKPOINT_PROVIDERS
+
+    for provider in CHECKPOINT_PROVIDERS:
+        provider()
+
 
 re_strip_checksum = re.compile(r"\s*\[[^]]+]\s*$")
 
