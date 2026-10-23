@@ -242,9 +242,15 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
 
             def state_dict(self, *args, destination=None, prefix="", **kwargs):
                 sd = destination if destination is not None else {}
-                return _quantized_weight_state_dict(self, sd, prefix, extra_quant_params=("input_scale",))
+                return _quantized_weight_state_dict(self, sd, prefix, extra_quant_params=("input_scale", "pre_quant_scale"))
 
             def forward(self, input, *args, **kwargs):
+                # AWQ (e.g. qwen3vl_32b_minimax_h3_nvfp4_awq): the weights were scaled by 1 / pre_quant_scale per input channel,
+                # so the activations must be multiplied back; skipping it garbled every down_proj and the text encoder ignored the prompt
+                pre_quant_scale = getattr(self, "pre_quant_scale", None)
+                if pre_quant_scale is not None and not isinstance(input, QuantizedTensor):
+                    input = input * cast_to_device(pre_quant_scale, input.device, input.dtype)
+
                 input_shape = input.shape
                 reshaped_nd = False
 
